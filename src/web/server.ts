@@ -1,8 +1,8 @@
 import { createServer } from "node:http";
 import { createReadStream } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { readdir, stat } from "node:fs/promises";
-import { extname, join } from "node:path";
+import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import { homedir } from "node:os";
@@ -29,6 +29,55 @@ export interface RunningWebServer {
   close: () => Promise<void>;
 }
 
+const CONFIG_PATH = join(homedir(), ".claude", "ccexplorer-config.json");
+
+interface CcExplorerConfig {
+  sessionDirs: string[];
+}
+
+async function readConfig(): Promise<CcExplorerConfig> {
+  try {
+    const raw = await readFile(CONFIG_PATH, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed.sessionDirs)) {
+      return { sessionDirs: parsed.sessionDirs };
+    }
+  } catch {
+    // missing or malformed config
+  }
+  return { sessionDirs: [] };
+}
+
+async function writeConfig(config: CcExplorerConfig): Promise<void> {
+  await mkdir(dirname(CONFIG_PATH), { recursive: true });
+  await writeFile(CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
+}
+
+async function discoverAllSessions(
+  defaultDir: string
+): Promise<
+  Array<{
+    sessionKey: string;
+    fileName: string;
+    projectName: string;
+    fullPath: string;
+    mtimeMs?: number;
+    firstUserMessage?: string;
+  }>
+> {
+  const config = await readConfig();
+  const dirs = [defaultDir, ...config.sessionDirs.map((d) => join(d, "projects"))];
+  const seen = new Set<string>();
+  const allEntries: Awaited<ReturnType<typeof discoverSessions>> = [];
+  for (const dir of dirs) {
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    const entries = await discoverSessions(dir);
+    allEntries.push(...entries);
+  }
+  return allEntries.sort((a, b) => (b.mtimeMs ?? 0) - (a.mtimeMs ?? 0));
+}
+
 export async function startWebServer(
   options: StartWebServerOptions
 ): Promise<RunningWebServer> {
@@ -40,7 +89,7 @@ export async function startWebServer(
     initialSessionPath,
   } = options;
 
-  let catalog = await discoverSessions(sessionsRootDir);
+  let catalog = await discoverAllSessions(sessionsRootDir);
   let catalogTimestamp = Date.now();
   const CATALOG_TTL_MS = 5000;
   const cache = new Map<string, { mtimeMs: number; analysis: Awaited<ReturnType<typeof analyzeSessionPath>> }>();
@@ -75,10 +124,36 @@ export async function startWebServer(
 
     if (url.pathname === "/api/sessions") {
       if (Date.now() - catalogTimestamp > CATALOG_TTL_MS) {
-        catalog = await discoverSessions(sessionsRootDir);
+        catalog = await discoverAllSessions(sessionsRootDir);
         catalogTimestamp = Date.now();
       }
       return json(res, 200, catalog);
+    }
+
+    if (url.pathname === "/api/session-dirs") {
+      if (req.method === "GET") {
+        const config = await readConfig();
+        return json(res, 200, {
+          defaultDir: dirname(sessionsRootDir),
+          extraDirs: config.sessionDirs,
+        });
+      }
+      if (req.method === "POST") {
+        const body = await readBody(req);
+        const parsed = JSON.parse(body);
+        if (!Array.isArray(parsed.dirs)) {
+          return json(res, 400, { error: "Expected { dirs: string[] }" });
+        }
+        const config: CcExplorerConfig = { sessionDirs: parsed.dirs };
+        await writeConfig(config);
+        // Force catalog refresh
+        catalog = await discoverAllSessions(sessionsRootDir);
+        catalogTimestamp = Date.now();
+        return json(res, 200, {
+          defaultDir: dirname(sessionsRootDir),
+          extraDirs: config.sessionDirs,
+        });
+      }
     }
 
     const analysis = selectedKey
@@ -213,6 +288,15 @@ function json(
   res.end(JSON.stringify(body));
 }
 
+function readBody(req: import("node:http").IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+    req.on("error", reject);
+  });
+}
+
 async function serveFile(
   res: import("node:http").ServerResponse,
   filePath: string
@@ -324,9 +408,7 @@ async function discoverSessions(rootDir: string): Promise<
     }
   }
 
-  return entries
-    .sort((a, b) => (b.mtimeMs ?? 0) - (a.mtimeMs ?? 0))
-    .map(({ mtimeMs: _mtimeMs, ...rest }) => rest);
+  return entries.sort((a, b) => (b.mtimeMs ?? 0) - (a.mtimeMs ?? 0));
 }
 
 function resolveSessionKey(

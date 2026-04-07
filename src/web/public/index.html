@@ -22,6 +22,13 @@
           <span class="session-trigger-label">Session</span>
           <span id="session-current-label" class="session-current-label">Loading...</span>
         </button>
+        <button
+          id="settings-btn"
+          class="nav-btn"
+          title="Session directories"
+          aria-haspopup="dialog"
+          aria-controls="settings-modal"
+        >&#9881;</button>
       </div>
     </header>
     <main>
@@ -45,6 +52,27 @@
             />
           </div>
           <div id="session-modal-list" class="session-modal-list"></div>
+        </div>
+      </div>
+    </div>
+    <div id="settings-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="settings-modal-title">
+      <div id="settings-modal-backdrop" class="modal-backdrop"></div>
+      <div class="modal-panel">
+        <div class="modal-header">
+          <h2 id="settings-modal-title">Session Directories</h2>
+          <button id="settings-modal-close" class="modal-close-btn" aria-label="Close settings">×</button>
+        </div>
+        <div class="modal-content">
+          <p class="settings-hint">Point to a Claude data directory (e.g. <code>~/.claude</code>). Sessions are discovered from the <code>projects/</code> subdirectory inside each.</p>
+          <div class="settings-dir-row settings-dir-default">
+            <span class="settings-dir-label">Default</span>
+            <code id="settings-default-dir" class="settings-dir-path"></code>
+          </div>
+          <div id="settings-extra-dirs"></div>
+          <div class="settings-add-row">
+            <input id="settings-new-dir" class="settings-dir-input" type="text" placeholder="/path/to/.claude" />
+            <button id="settings-add-btn" class="settings-add-btn">Add</button>
+          </div>
         </div>
       </div>
     </div>

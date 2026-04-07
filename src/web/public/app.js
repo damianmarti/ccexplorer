@@ -1100,10 +1100,124 @@ if (sessionModalSearchInput instanceof HTMLInputElement) {
 }
 
 window.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && sessionModalOpen) {
-    closeSessionModal();
+  if (event.key === "Escape") {
+    if (settingsModalOpen) closeSettingsModal();
+    else if (sessionModalOpen) closeSessionModal();
   }
 });
+
+// --- Settings modal for session directories ---
+const settingsBtn = document.getElementById("settings-btn");
+const settingsModal = document.getElementById("settings-modal");
+const settingsModalClose = document.getElementById("settings-modal-close");
+const settingsModalBackdrop = document.getElementById("settings-modal-backdrop");
+const settingsDefaultDir = document.getElementById("settings-default-dir");
+const settingsExtraDirs = document.getElementById("settings-extra-dirs");
+const settingsNewDir = document.getElementById("settings-new-dir");
+const settingsAddBtn = document.getElementById("settings-add-btn");
+let settingsModalOpen = false;
+let settingsDirState = { defaultDir: "", extraDirs: [] };
+
+function closeSettingsModal() {
+  if (settingsModal) settingsModal.classList.add("hidden");
+  settingsModalOpen = false;
+}
+
+function renderSettingsDirs() {
+  if (!settingsExtraDirs) return;
+  if (settingsDefaultDir) settingsDefaultDir.textContent = settingsDirState.defaultDir;
+  if (settingsDirState.extraDirs.length === 0) {
+    settingsExtraDirs.innerHTML = "";
+    return;
+  }
+  settingsExtraDirs.innerHTML = settingsDirState.extraDirs
+    .map((dir, i) => `
+      <div class="settings-dir-row">
+        <span class="settings-dir-label">Extra</span>
+        <code class="settings-dir-path" title="${escapeHtml(dir)}">${escapeHtml(dir)}</code>
+        <button class="settings-dir-remove" data-dir-index="${i}" title="Remove">&times;</button>
+      </div>
+    `)
+    .join("");
+  for (const btn of settingsExtraDirs.querySelectorAll(".settings-dir-remove")) {
+    btn.addEventListener("click", async () => {
+      const idx = Number(btn.getAttribute("data-dir-index"));
+      settingsDirState.extraDirs.splice(idx, 1);
+      await saveSettingsDirs();
+      renderSettingsDirs();
+    });
+  }
+}
+
+async function loadSettingsDirs() {
+  try {
+    const res = await fetch("/api/session-dirs");
+    if (res.ok) {
+      settingsDirState = await res.json();
+    }
+  } catch {
+    // ignore
+  }
+}
+
+async function saveSettingsDirs() {
+  try {
+    await fetch("/api/session-dirs", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ dirs: settingsDirState.extraDirs }),
+    });
+    // Refresh the session list
+    const sessionsRes = await fetch("/api/sessions");
+    if (sessionsRes.ok) {
+      currentSessions = await sessionsRes.json();
+      updateSessionTriggerLabel(currentSessions);
+      renderSessionModalList(currentSessions);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+async function openSettingsModal() {
+  if (!settingsModal) return;
+  await loadSettingsDirs();
+  renderSettingsDirs();
+  settingsModal.classList.remove("hidden");
+  settingsModalOpen = true;
+  if (settingsNewDir instanceof HTMLInputElement) settingsNewDir.focus();
+}
+
+if (settingsBtn) {
+  settingsBtn.addEventListener("click", () => openSettingsModal());
+}
+
+if (settingsModalClose) {
+  settingsModalClose.addEventListener("click", () => closeSettingsModal());
+}
+
+if (settingsModalBackdrop) {
+  settingsModalBackdrop.addEventListener("click", () => closeSettingsModal());
+}
+
+if (settingsAddBtn && settingsNewDir instanceof HTMLInputElement) {
+  async function addDir() {
+    const dir = settingsNewDir.value.trim();
+    if (!dir) return;
+    if (dir === settingsDirState.defaultDir || settingsDirState.extraDirs.includes(dir)) {
+      settingsNewDir.value = "";
+      return;
+    }
+    settingsDirState.extraDirs.push(dir);
+    settingsNewDir.value = "";
+    await saveSettingsDirs();
+    renderSettingsDirs();
+  }
+  settingsAddBtn.addEventListener("click", addDir);
+  settingsNewDir.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") addDir();
+  });
+}
 
 async function boot() {
   const sessionsRes = await fetch("/api/sessions");
@@ -1113,7 +1227,9 @@ async function boot() {
   }
   const sessions = await sessionsRes.json();
   if (sessions.length === 0) {
-    app.textContent = "No sessions found in ~/.claude/projects.";
+    app.innerHTML = 'No sessions found. Click the <button id="empty-settings-btn" class="nav-btn" style="display:inline;vertical-align:middle;width:auto;height:auto;padding:2px 6px;font-size:14px">&#9881;</button> button to add session directories.';
+    const emptySettingsBtn = document.getElementById("empty-settings-btn");
+    if (emptySettingsBtn) emptySettingsBtn.addEventListener("click", () => openSettingsModal());
     return;
   }
   const url = new URL(window.location.href);
