@@ -1,6 +1,6 @@
 {
   "name": "ccexplorer",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Browser-based explorer for Claude Code sessions.",
   "author": "Elliott Alexander <escottalexander@gmail.com>",
   "repository": {
