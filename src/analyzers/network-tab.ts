@@ -4,6 +4,7 @@ import type {
   UserEvent,
   ProgressEvent,
   SystemEvent,
+  AttachmentEvent,
   SessionEvent,
   NetworkAgentScope,
   NetworkRequestEntry,
@@ -273,9 +274,202 @@ function buildTimelineEvents(
         durationMs,
       });
     }
+  } else if (event.type === "attachment") {
+    results.push(buildAttachmentTimelineEvent(event as AttachmentEvent, counter));
   }
 
   return results;
+}
+
+/**
+ * Map an "attachment" event (newer Claude Code shape) onto a timeline row.
+ * Hook payloads (hook_success / hook_additional_context) reuse the existing
+ * "hook" kind; everything else becomes a generic "attachment" row whose
+ * subtype is carried in `attachmentType`.
+ */
+function buildAttachmentTimelineEvent(
+  event: AttachmentEvent,
+  counter: number
+): NetworkTimelineEvent {
+  const scopeId = event.isSidechain ? "unknown" : "main";
+  const att = event.attachment ?? { type: "unknown" };
+  const subtype = typeof att.type === "string" ? att.type : "unknown";
+  const id = `attachment-${event.uuid}-${counter}`;
+
+  if (subtype === "hook_success") {
+    const hookName = typeof att.hookName === "string" ? att.hookName : "hook";
+    const hookEvent = typeof att.hookEvent === "string" ? att.hookEvent : undefined;
+    const command = typeof att.command === "string" ? att.command : "";
+    const stdout = typeof att.stdout === "string" ? att.stdout : "";
+    const stderr = typeof att.stderr === "string" ? att.stderr : "";
+    const exitCode = typeof att.exitCode === "number" ? att.exitCode : undefined;
+    const durationMs = typeof att.durationMs === "number" ? att.durationMs : undefined;
+    const content = stdout || (typeof att.content === "string" ? att.content : "");
+    return {
+      id,
+      kind: "hook",
+      timestamp: event.timestamp,
+      scopeId,
+      summary: hookName,
+      content: content || command || hookName,
+      hookEvent,
+      hookName,
+      progressType: "hook_success",
+      durationMs,
+      hookCommand: command,
+      hookStdout: stdout,
+      hookStderr: stderr,
+      hookExitCode: exitCode,
+    };
+  }
+
+  if (subtype === "hook_additional_context") {
+    const hookName = typeof att.hookName === "string" ? att.hookName : "hook";
+    const hookEvent = typeof att.hookEvent === "string" ? att.hookEvent : undefined;
+    const content = Array.isArray(att.content)
+      ? att.content.filter((c): c is string => typeof c === "string").join("\n\n")
+      : typeof att.content === "string"
+        ? att.content
+        : "";
+    return {
+      id,
+      kind: "hook",
+      timestamp: event.timestamp,
+      scopeId,
+      summary: `${hookName} (context)`,
+      content: content || hookName,
+      hookEvent,
+      hookName,
+      progressType: "hook_additional_context",
+    };
+  }
+
+  // Generic attachment: derive a friendly summary + content from the subtype.
+  const { summary, content } = summarizeAttachment(subtype, att);
+  return {
+    id,
+    kind: "attachment",
+    timestamp: event.timestamp,
+    scopeId,
+    summary,
+    content,
+    attachmentType: subtype,
+    attachmentData: att as Record<string, unknown>,
+  };
+}
+
+function summarizeAttachment(
+  subtype: string,
+  att: Record<string, unknown>
+): { summary: string; content: string } {
+  const str = (v: unknown): string => (typeof v === "string" ? v : "");
+  const num = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
+  const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+
+  switch (subtype) {
+    case "deferred_tools_delta": {
+      const added = arr(att.addedNames);
+      const removed = arr(att.removedNames);
+      return {
+        summary: `Tools: +${added.length} -${removed.length}`,
+        content:
+          (added.length ? `Added:\n${added.join("\n")}\n` : "") +
+          (removed.length ? `\nRemoved:\n${removed.join("\n")}` : ""),
+      };
+    }
+    case "skill_listing": {
+      const count = num(att.skillCount);
+      return {
+        summary: `Skills listed${count != null ? ` (${count})` : ""}`,
+        content: str(att.content),
+      };
+    }
+    case "invoked_skills": {
+      const skills = arr(att.skills);
+      return {
+        summary: `Skills invoked (${skills.length})`,
+        content: JSON.stringify(skills, null, 2),
+      };
+    }
+    case "task_reminder": {
+      const itemCount = num(att.itemCount);
+      return {
+        summary: `Task reminder${itemCount != null ? ` (${itemCount})` : ""}`,
+        content:
+          typeof att.content === "string"
+            ? att.content
+            : JSON.stringify(att.content ?? null, null, 2),
+      };
+    }
+    case "queued_command": {
+      const prompt = str(att.prompt);
+      return {
+        summary: `Queued command${att.commandMode ? ` (${str(att.commandMode)})` : ""}`,
+        content: prompt,
+      };
+    }
+    case "plan_mode":
+      return {
+        summary: `Plan mode${att.reminderType ? ` (${str(att.reminderType)})` : ""}`,
+        content: `planFilePath: ${str(att.planFilePath)}\nplanExists: ${String(att.planExists)}\nisSubAgent: ${String(att.isSubAgent)}`,
+      };
+    case "plan_mode_exit":
+      return {
+        summary: "Plan mode exit",
+        content: `planFilePath: ${str(att.planFilePath)}\nplanExists: ${String(att.planExists)}`,
+      };
+    case "plan_mode_reentry":
+      return {
+        summary: "Plan mode reentry",
+        content: `planFilePath: ${str(att.planFilePath)}`,
+      };
+    case "plan_file_reference":
+      return {
+        summary: `Plan: ${basename(str(att.planFilePath))}`,
+        content: `Path: ${str(att.planFilePath)}\n\n${str(att.planContent)}`,
+      };
+    case "file":
+      return {
+        summary: `File: ${str(att.displayPath) || basename(str(att.filename))}`,
+        content:
+          typeof att.content === "string"
+            ? att.content
+            : JSON.stringify(att.content ?? null, null, 2),
+      };
+    case "compact_file_reference":
+      return {
+        summary: `File ref: ${str(att.displayPath) || basename(str(att.filename))}`,
+        content: `filename: ${str(att.filename)}\ndisplayPath: ${str(att.displayPath)}`,
+      };
+    case "edited_text_file":
+      return {
+        summary: `Edited: ${basename(str(att.filename))}`,
+        content: `${str(att.filename)}\n\n${str(att.snippet)}`,
+      };
+    case "date_change":
+      return {
+        summary: `Date change: ${str(att.newDate)}`,
+        content: `New date: ${str(att.newDate)}`,
+      };
+    case "command_permissions": {
+      const allowed = arr(att.allowedTools);
+      return {
+        summary: `Permissions: ${allowed.length} allowed`,
+        content: allowed.join("\n"),
+      };
+    }
+    default:
+      return {
+        summary: subtype,
+        content: JSON.stringify(att, null, 2),
+      };
+  }
+}
+
+function basename(p: string): string {
+  if (!p) return "";
+  const idx = p.lastIndexOf("/");
+  return idx >= 0 ? p.slice(idx + 1) : p;
 }
 
 /**

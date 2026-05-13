@@ -9,6 +9,7 @@ const VALID_TYPES = new Set([
   "assistant",
   "system",
   "progress",
+  "attachment",
   "file-history-snapshot",
 ]);
 

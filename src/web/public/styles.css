@@ -586,6 +586,12 @@ tbody td:nth-child(5) {
   border: 1px solid #6a5a2a;
 }
 
+.kind-badge-attachment {
+  background: #2a3a4a;
+  color: #9ec8e8;
+  border: 1px solid #3a5a7a;
+}
+
 .spawns-subagent-badge {
   background: #7c2de8;
   color: #f0e0ff;
@@ -700,6 +706,10 @@ tbody td:nth-child(5) {
   font-style: italic;
 }
 
+.row.kind-attachment {
+  border-left: 3px solid #3a5a7a;
+}
+
 .row.kind-tool-result:hover {
   background: #1a2a30;
 }
@@ -726,6 +736,10 @@ tbody td:nth-child(5) {
 
 .row.kind-compaction:hover {
   background: #3a2e1e;
+}
+
+.row.kind-attachment:hover {
+  background: #1f2a35;
 }
 
 tbody td:first-child {

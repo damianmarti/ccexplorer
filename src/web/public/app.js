@@ -8,6 +8,7 @@ const KIND_LABELS = {
   hook: "Hook",
   system: "System",
   compaction: "Compaction",
+  attachment: "Attachment",
 };
 
 const KIND_COLORS = {
@@ -18,6 +19,7 @@ const KIND_COLORS = {
   hook: "kind-hook",
   system: "kind-system",
   compaction: "kind-compaction",
+  attachment: "kind-attachment",
 };
 
 const state = {
@@ -643,11 +645,33 @@ function renderDetailPanel(evt, contextTurn) {
   }
 
   if (evt.kind === "hook") {
+    const hookEventLine = evt.hookEvent ? `<p><strong>Hook event:</strong> ${escapeHtml(evt.hookEvent)}</p>` : "";
+    const cmdLine = evt.hookCommand ? `<p><strong>Command:</strong> ${escapeHtml(evt.hookCommand)}</p>` : "";
+    const exitLine = evt.hookExitCode != null ? `<p><strong>Exit code:</strong> ${evt.hookExitCode}</p>` : "";
+    const durLine = evt.durationMs != null ? `<p><strong>Duration:</strong> ${timeText(evt.durationMs)}</p>` : "";
+    const stderrBlock = evt.hookStderr
+      ? `<h4>stderr</h4><pre>${escapeHtml(evt.hookStderr)}</pre>`
+      : "";
     return `
       <h3>Hook ${timeBadge}</h3>
       ${evt.hookName ? `<p><strong>Hook name:</strong> ${escapeHtml(evt.hookName)}</p>` : ""}
+      ${hookEventLine}
+      ${cmdLine}
+      ${exitLine}
+      ${durLine}
       ${ctxInfo}
       <h4>Content</h4>
+      <pre>${escapeHtml(evt.content)}</pre>
+      ${stderrBlock}`;
+  }
+
+  if (evt.kind === "attachment") {
+    const subtypeLine = evt.attachmentType ? `<p><strong>Subtype:</strong> ${escapeHtml(evt.attachmentType)}</p>` : "";
+    return `
+      <h3>Attachment ${timeBadge}</h3>
+      ${subtypeLine}
+      ${ctxInfo}
+      <h4>${escapeHtml(evt.summary || "Content")}</h4>
       <pre>${escapeHtml(evt.content)}</pre>`;
   }
 

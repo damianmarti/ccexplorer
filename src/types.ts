@@ -153,11 +153,36 @@ export interface FileHistorySnapshot {
   isSnapshotUpdate: boolean;
 }
 
+// Newer Claude Code versions emit hook outcomes, skill listings, plan-mode
+// transitions, file references, etc. as top-level "attachment" events. The
+// inner attachment payload is keyed by `attachment.type` (the subtype).
+export interface AttachmentPayload {
+  type: string;
+  [key: string]: unknown;
+}
+
+export interface AttachmentEvent {
+  type: "attachment";
+  uuid: string;
+  parentUuid: string | null;
+  sessionId?: string;
+  timestamp: string;
+  attachment: AttachmentPayload;
+  isSidechain: boolean;
+  cwd?: string;
+  version?: string;
+  gitBranch?: string;
+  userType?: string;
+  entrypoint?: string;
+  slug?: string;
+}
+
 export type SessionEvent =
   | UserEvent
   | AssistantEvent
   | SystemEvent
   | ProgressEvent
+  | AttachmentEvent
   | FileHistorySnapshot;
 
 // Tool call paired with its result
@@ -255,7 +280,8 @@ export type NetworkEventKind =
   | "thinking"
   | "hook"
   | "system"
-  | "compaction";
+  | "compaction"
+  | "attachment";
 
 export interface NetworkTimelineEvent {
   id: string;
@@ -294,6 +320,14 @@ export interface NetworkTimelineEvent {
   // Compaction-specific
   compactTrigger?: string;
   preTokens?: number;
+  // Attachment-specific
+  attachmentType?: string;
+  attachmentData?: Record<string, unknown>;
+  // Hook-specific (richer fields from attachment-shaped hook events)
+  hookCommand?: string;
+  hookStdout?: string;
+  hookStderr?: string;
+  hookExitCode?: number;
 }
 
 export interface NetworkAgentScope {
