@@ -11,6 +11,15 @@ const VALID_TYPES = new Set([
   "progress",
   "attachment",
   "file-history-snapshot",
+  "file-history-delta",
+  "ai-title",
+  "agent-name",
+  "last-prompt",
+  "mode",
+  "permission-mode",
+  "queue-operation",
+  "pr-link",
+  "frame-link",
 ]);
 
 function isSessionEvent(obj: unknown): obj is SessionEvent {

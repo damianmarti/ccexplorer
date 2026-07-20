@@ -598,6 +598,56 @@ tbody td:nth-child(5) {
   border: 1px solid #a050ff;
 }
 
+.api-error-badge {
+  background: #5c1a1a;
+  color: #f8a0a0;
+  border: 1px solid #8c2a2a;
+}
+
+.skill-badge {
+  background: #1a4a3a;
+  color: #7ee8c0;
+  border: 1px solid #2a6a5a;
+}
+
+.image-badge {
+  background: #2a3a4a;
+  color: #9ec8e8;
+  border: 1px solid #3a5a7a;
+  padding: 1px 4px;
+}
+
+.ctx-miss {
+  border-bottom: 1px dotted #e8c87a;
+  cursor: help;
+}
+
+.session-option-date {
+  margin-left: auto;
+  color: #9a9a9a;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.detail-images {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.detail-image {
+  max-width: 100%;
+  border: 1px solid #3a3a3a;
+  border-radius: 4px;
+  background: #fff;
+}
+
+.detail-link {
+  color: #7ec8f8;
+  word-break: break-all;
+}
+
 /* Detail panel time badge */
 .detail-time-badge {
   display: inline-block;

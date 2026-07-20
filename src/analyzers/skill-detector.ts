@@ -1,5 +1,6 @@
 import type { SessionTree } from "../parser/session-tree.js";
 import type { SkillFileImpact, ToolPair } from "../types.js";
+import { toDisplayText } from "./utils.js";
 
 const SKILL_PATTERNS = [
   { pattern: /CLAUDE\.md/i, type: "claude-md" as const },
@@ -71,10 +72,11 @@ function extractFilePath(pair: ToolPair): string | null {
 
   // Check tool result content for skill file paths
   if (pair.toolResult?.content) {
+    const resultText = toDisplayText(pair.toolResult.content);
     for (const { pattern: rx } of SKILL_PATTERNS) {
-      if (rx.test(pair.toolResult.content)) {
+      if (rx.test(resultText)) {
         // Extract first matching path
-        const match = pair.toolResult.content.match(
+        const match = resultText.match(
           /\S*(?:CLAUDE\.md|SKILL\.md|\.claude\/|skills\/|AGENTS\.md)\S*/i
         );
         if (match) return match[0];

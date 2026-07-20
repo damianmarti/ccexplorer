@@ -11,7 +11,12 @@ import type {
   NetworkTimelineEvent,
   NetworkEventKind,
 } from "../types.js";
-import { toDisplayText, getScopeId } from "./utils.js";
+import {
+  toDisplayText,
+  extractContentParts,
+  getScopeId,
+  sanitizeMetadata,
+} from "./utils.js";
 
 interface NetworkTabResult {
   scopes: NetworkAgentScope[];
@@ -124,6 +129,7 @@ function buildTimelineEvents(
     const ae = event as AssistantEvent;
     const scopeId = getScopeId(ae);
     const reqId = ae.requestId ?? ae.uuid;
+    const requestMeta = buildAssistantRequestMeta(ae);
     for (const block of ae.message.content) {
       if (block.type === "thinking") {
         const preview = block.thinking.slice(0, 200);
@@ -139,6 +145,7 @@ function buildTimelineEvents(
           cacheCreationTokens: ae.message.usage.cache_creation_input_tokens,
           cacheReadTokens: ae.message.usage.cache_read_input_tokens,
           requestId: reqId,
+          ...requestMeta,
         });
       } else if (block.type === "text") {
         const preview = block.text.slice(0, 200);
@@ -154,6 +161,8 @@ function buildTimelineEvents(
           cacheCreationTokens: ae.message.usage.cache_creation_input_tokens,
           cacheReadTokens: ae.message.usage.cache_read_input_tokens,
           requestId: reqId,
+          isError: ae.isApiErrorMessage === true,
+          ...requestMeta,
         });
       } else if (block.type === "tool_use") {
         const linkedSubagentId =
@@ -175,6 +184,21 @@ function buildTimelineEvents(
           toolInput: block.input,
           toolResultContent: null,
           requestId: reqId,
+          ...requestMeta,
+        });
+      } else if (block.type === "fallback") {
+        const from = block.from?.model ?? "unknown";
+        const to = block.to?.model ?? "unknown";
+        results.push({
+          id: `fallback-${ae.uuid}-${counter++}`,
+          kind: "system",
+          timestamp: ae.timestamp,
+          scopeId,
+          summary: `Model fallback: ${from} → ${to}`,
+          content: `Switched from ${from} to ${to}`,
+          subtype: "model_fallback",
+          requestId: reqId,
+          systemData: { from, to },
         });
       }
     }
@@ -194,21 +218,26 @@ function buildTimelineEvents(
         content: text,
       });
     } else if (Array.isArray(ue.message.content)) {
-      // Tool results - match them back to existing tool_use events in the scope
-      for (const block of ue.message.content) {
-        if (block.type === "tool_result") {
-          // tool_result data is merged into the matching tool_use event
-          // via mergeToolResults() after all events are collected.
-        } else if (block.type === "text") {
-          results.push({
-            id: `user-text-${ue.uuid}-${counter++}`,
-            kind: "user_message",
-            timestamp: ue.timestamp,
-            scopeId,
-            summary: (block as any).text?.split("\n")[0]?.slice(0, 80) || "User text",
-            content: (block as any).text ?? "",
-          });
-        }
+      // Combine text, pasted images, and attached documents into one row.
+      // tool_result blocks are merged into the matching tool_use event
+      // via mergeToolResults() after all events are collected.
+      const nonToolBlocks = ue.message.content.filter(
+        (block) => block.type !== "tool_result"
+      );
+      if (nonToolBlocks.length > 0) {
+        const { text, images } = extractContentParts(nonToolBlocks);
+        const summary =
+          text.split("\n")[0]?.slice(0, 80) ||
+          (images.length > 0 ? `Image (${images.length})` : "User message");
+        results.push({
+          id: `user-text-${ue.uuid}-${counter++}`,
+          kind: "user_message",
+          timestamp: ue.timestamp,
+          scopeId,
+          summary,
+          content: text,
+          images: images.length > 0 ? images : undefined,
+        });
       }
     }
   } else if (event.type === "progress") {
@@ -238,13 +267,13 @@ function buildTimelineEvents(
     });
   } else if (event.type === "system") {
     const se = event as SystemEvent;
-    const scopeId = se.isSidechain ? "unknown" : "main";
+    const scopeId = getScopeId(se);
     const subtype = se.subtype ?? "system";
-    const durationMs = (se as any).durationMs ?? undefined;
+    const durationMs = se.durationMs ?? undefined;
 
     if (subtype === "compact_boundary") {
-      const preTokens = se.compactMetadata?.preTokens ?? undefined;
-      const trigger = se.compactMetadata?.trigger ?? undefined;
+      const meta = se.compactMetadata;
+      const trigger = meta?.trigger ?? undefined;
       // Resolve compaction subagent via logicalParentUuid → agentId
       const logicalParent = se.logicalParentUuid;
       const linkedSubagentId = logicalParent
@@ -259,26 +288,179 @@ function buildTimelineEvents(
         content: se.content ?? "Conversation compacted",
         subtype,
         compactTrigger: trigger,
-        preTokens,
+        preTokens: meta?.preTokens ?? undefined,
+        postTokens: meta?.postTokens ?? undefined,
+        droppedTokens: meta?.cumulativeDroppedTokens ?? undefined,
+        durationMs: meta?.durationMs ?? undefined,
         linkedSubagentId,
       });
     } else {
+      const { summary, content, systemData } = summarizeSystemEvent(se, subtype, durationMs);
       results.push({
         id: `system-${se.uuid}-${counter}`,
         kind: "system",
         timestamp: se.timestamp,
         scopeId,
-        summary: subtype,
-        content: se.content ?? (durationMs ? `Turn duration: ${durationMs}ms` : subtype),
+        summary,
+        content,
         subtype,
         durationMs,
+        systemData,
       });
     }
   } else if (event.type === "attachment") {
     results.push(buildAttachmentTimelineEvent(event as AttachmentEvent, counter));
+  } else if (event.type === "queue-operation") {
+    const text = event.content ?? "";
+    const firstLine = text.split("\n").find((l) => l.trim().length > 0) ?? "";
+    results.push({
+      id: `queue-${event.timestamp}-${counter}`,
+      kind: "system",
+      timestamp: event.timestamp,
+      scopeId: "main",
+      summary: `Queue ${event.operation}${firstLine ? `: ${firstLine.slice(0, 60)}` : ""}`,
+      content: text || event.operation,
+      subtype: "queue_operation",
+      systemData: { operation: event.operation },
+    });
+  } else if (event.type === "pr-link") {
+    const repo = event.prRepository ?? "";
+    const label = `PR #${event.prNumber ?? "?"}${repo ? ` — ${repo}` : ""}`;
+    results.push({
+      id: `pr-link-${event.timestamp}-${counter}`,
+      kind: "system",
+      timestamp: event.timestamp,
+      scopeId: "main",
+      summary: `Pull request created: ${label}`,
+      content: event.prUrl ?? label,
+      subtype: "pr_link",
+      systemData: {
+        prNumber: event.prNumber,
+        prUrl: event.prUrl,
+        prRepository: event.prRepository,
+      },
+    });
+  } else if (event.type === "frame-link") {
+    results.push({
+      id: `frame-link-${event.timestamp}-${counter}`,
+      kind: "system",
+      timestamp: event.timestamp,
+      scopeId: "main",
+      summary: `Artifact published${event.title ? `: ${event.title}` : ""}`,
+      content: event.frameUrl ?? event.path ?? "Artifact published",
+      subtype: "frame_link",
+      systemData: {
+        title: event.title,
+        frameUrl: event.frameUrl,
+        path: event.path,
+      },
+    });
   }
 
   return results;
+}
+
+/** Request-level metadata shared by every row emitted from one assistant event. */
+function buildAssistantRequestMeta(ae: AssistantEvent): Partial<NetworkTimelineEvent> {
+  const meta: Partial<NetworkTimelineEvent> = {};
+  if (ae.message.model) meta.model = ae.message.model;
+  if (ae.effort) meta.effort = ae.effort;
+  if (ae.attributionSkill) meta.attributionSkill = ae.attributionSkill;
+  if (ae.attributionAgent) meta.attributionAgent = ae.attributionAgent;
+  if (ae.attributionMcpServer) meta.attributionMcpServer = ae.attributionMcpServer;
+  const miss = ae.message.diagnostics?.cache_miss_reason;
+  if (miss && typeof miss.type === "string") {
+    meta.cacheMissReason = {
+      type: miss.type,
+      tokens:
+        typeof miss.cache_missed_input_tokens === "number"
+          ? miss.cache_missed_input_tokens
+          : undefined,
+    };
+  }
+  if (ae.isApiErrorMessage) {
+    meta.apiError = ae.error ?? "api_error";
+    meta.apiErrorStatus = ae.apiErrorStatus ?? undefined;
+  }
+  return meta;
+}
+
+/** Friendly summaries for non-compaction system subtypes. */
+function summarizeSystemEvent(
+  se: SystemEvent,
+  subtype: string,
+  durationMs: number | undefined
+): { summary: string; content: string; systemData?: Record<string, unknown> } {
+  const raw = se as unknown as Record<string, unknown>;
+
+  if (subtype === "turn_duration") {
+    const messageCount = se.messageCount;
+    const parts = [
+      durationMs != null ? `Turn took ${(durationMs / 1000).toFixed(1)}s` : "Turn duration",
+      messageCount != null ? `${messageCount} messages` : null,
+    ].filter(Boolean);
+    return { summary: parts.join(" · "), content: parts.join(" · ") };
+  }
+
+  if (subtype === "away_summary") {
+    const text = se.content ?? "";
+    return {
+      summary: `Recap: ${text.split("\n")[0]?.slice(0, 70) ?? ""}`,
+      content: text,
+    };
+  }
+
+  if (subtype === "model_refusal_fallback") {
+    const from = typeof raw.originalModel === "string" ? raw.originalModel : "?";
+    const to = typeof raw.fallbackModel === "string" ? raw.fallbackModel : "?";
+    return {
+      summary: `Model fallback (refusal): ${from} → ${to}`,
+      content: se.content ?? `Switched from ${from} to ${to} after a safeguards refusal`,
+      systemData: pickKeys(raw, [
+        "trigger",
+        "direction",
+        "originalModel",
+        "fallbackModel",
+        "apiRefusalCategory",
+        "apiRefusalExplanation",
+        "retractedMessageUuids",
+      ]),
+    };
+  }
+
+  if (subtype === "stop_hook_summary") {
+    const hookCount = typeof raw.hookCount === "number" ? raw.hookCount : undefined;
+    const prevented = raw.preventedContinuation === true;
+    return {
+      summary: `Stop hook${hookCount != null ? ` (${hookCount})` : ""}${prevented ? " — prevented stop" : ""}`,
+      content: se.content ?? "Stop hook ran",
+      systemData: pickKeys(raw, [
+        "hookCount",
+        "hookInfos",
+        "hookErrors",
+        "hookAdditionalContext",
+        "preventedContinuation",
+        "stopReason",
+      ]),
+    };
+  }
+
+  return {
+    summary: subtype,
+    content:
+      se.content ?? (durationMs ? `Turn duration: ${durationMs}ms` : subtype),
+  };
+}
+
+function pickKeys(
+  source: Record<string, unknown>,
+  keys: string[]
+): Record<string, unknown> | undefined {
+  const out: Record<string, unknown> = {};
+  for (const key of keys) {
+    if (source[key] !== undefined && source[key] !== null) out[key] = source[key];
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /**
@@ -291,7 +473,7 @@ function buildAttachmentTimelineEvent(
   event: AttachmentEvent,
   counter: number
 ): NetworkTimelineEvent {
-  const scopeId = event.isSidechain ? "unknown" : "main";
+  const scopeId = getScopeId(event);
   const att = event.attachment ?? { type: "unknown" };
   const subtype = typeof att.type === "string" ? att.type : "unknown";
   const id = `attachment-${event.uuid}-${counter}`;
@@ -377,6 +559,37 @@ function summarizeAttachment(
           (removed.length ? `\nRemoved:\n${removed.join("\n")}` : ""),
       };
     }
+    case "agent_listing_delta": {
+      const added = arr(att.addedTypes);
+      const lines = arr(att.addedLines);
+      return {
+        summary: `Agents: +${added.length}`,
+        content: lines.length
+          ? lines.map((l) => str(l)).join("\n")
+          : added.map((t) => str(t)).join("\n"),
+      };
+    }
+    case "mcp_instructions_delta": {
+      const added = arr(att.addedNames);
+      const blocks = arr(att.addedBlocks);
+      return {
+        summary: `MCP instructions: ${added.map((n) => str(n)).join(", ") || added.length}`,
+        content: blocks.map((b) => str(b)).join("\n\n"),
+      };
+    }
+    case "goal_status": {
+      const met = att.met === true;
+      const condition = str(att.condition);
+      return {
+        summary: `Goal ${met ? "met" : "not met"}`,
+        content: condition || JSON.stringify(att, null, 2),
+      };
+    }
+    case "ultrathink_effort":
+      return {
+        summary: "Ultrathink effort",
+        content: "Extended thinking effort raised for this turn",
+      };
     case "skill_listing": {
       const count = num(att.skillCount);
       return {
@@ -502,10 +715,15 @@ function mergeToolResults(
   for (const pair of tree.getToolPairs()) {
     const te = toolUseMap.get(pair.toolUse.id);
     if (te && pair.toolResult) {
+      const { text, images } = extractContentParts(pair.toolResult.content);
       te.isError = pair.toolResult.is_error ?? false;
-      te.toolResultContent = toDisplayText(pair.toolResult.content);
+      te.toolResultContent = text;
+      te.toolResultImages = images.length > 0 ? images : undefined;
       te.timeMs = computeTimeMs(pair.assistantTimestamp, pair.resultTimestamp);
-      te.toolUseResult = toolUseResultMap.get(pair.toolUse.id) ?? undefined;
+      const meta = toolUseResultMap.get(pair.toolUse.id);
+      te.toolUseResult = meta
+        ? (sanitizeMetadata(meta) as Record<string, unknown>)
+        : undefined;
     }
   }
 }
