@@ -537,4 +537,131 @@ describe("analyzeNetworkTab", () => {
       "alpha_agent",
     ]);
   });
+
+  it("surfaces attachment-shaped hook outputs as hook timeline events", () => {
+    const events: SessionEvent[] = [
+      {
+        type: "attachment",
+        uuid: "att-hook-1",
+        parentUuid: null,
+        sessionId: "s1",
+        timestamp: "2026-05-13T18:15:25.895Z",
+        isSidechain: false,
+        cwd: "/tmp",
+        attachment: {
+          type: "hook_success",
+          hookName: "SessionStart:startup",
+          toolUseID: "tool_startup",
+          hookEvent: "SessionStart",
+          content: "CAVEMAN MODE ACTIVE",
+          stdout: "CAVEMAN MODE ACTIVE",
+          stderr: "",
+          exitCode: 0,
+          command: "Loading caveman mode...",
+          durationMs: 318,
+        },
+      } as SessionEvent,
+      {
+        type: "attachment",
+        uuid: "att-hook-2",
+        parentUuid: "att-hook-1",
+        sessionId: "s1",
+        timestamp: "2026-05-13T18:15:26.789Z",
+        isSidechain: false,
+        cwd: "/tmp",
+        attachment: {
+          type: "hook_additional_context",
+          hookName: "SessionStart",
+          hookEvent: "SessionStart",
+          toolUseID: "SessionStart",
+          content: ["Skill listing here", "More context"],
+        },
+      } as SessionEvent,
+    ];
+
+    const result = analyzeNetworkTab(new SessionTree(events));
+    const main = result.scopes.find((s) => s.id === "main");
+    expect(main).toBeDefined();
+    const hooks = main!.events.filter((e) => e.kind === "hook");
+    expect(hooks).toHaveLength(2);
+
+    const success = hooks.find((h) => h.progressType === "hook_success")!;
+    expect(success.hookName).toBe("SessionStart:startup");
+    expect(success.hookEvent).toBe("SessionStart");
+    expect(success.hookCommand).toBe("Loading caveman mode...");
+    expect(success.hookExitCode).toBe(0);
+    expect(success.durationMs).toBe(318);
+    expect(success.content).toContain("CAVEMAN MODE ACTIVE");
+
+    const ctx = hooks.find((h) => h.progressType === "hook_additional_context")!;
+    expect(ctx.summary).toContain("SessionStart");
+    expect(ctx.content).toContain("Skill listing here");
+    expect(ctx.content).toContain("More context");
+  });
+
+  it("surfaces non-hook attachment subtypes as attachment timeline events", () => {
+    const events: SessionEvent[] = [
+      {
+        type: "attachment",
+        uuid: "att-tools",
+        parentUuid: null,
+        sessionId: "s1",
+        timestamp: "2026-05-13T18:15:31.976Z",
+        isSidechain: false,
+        cwd: "/tmp",
+        attachment: {
+          type: "deferred_tools_delta",
+          addedNames: ["WebFetch", "WebSearch"],
+          addedLines: ["WebFetch", "WebSearch"],
+          removedNames: [],
+        },
+      } as SessionEvent,
+      {
+        type: "attachment",
+        uuid: "att-skills",
+        parentUuid: "att-tools",
+        sessionId: "s1",
+        timestamp: "2026-05-13T18:15:31.977Z",
+        isSidechain: false,
+        cwd: "/tmp",
+        attachment: {
+          type: "skill_listing",
+          content: "- skill-a\n- skill-b",
+          skillCount: 2,
+          isInitial: true,
+        },
+      } as SessionEvent,
+      {
+        type: "attachment",
+        uuid: "att-date",
+        parentUuid: "att-skills",
+        sessionId: "s1",
+        timestamp: "2026-05-13T18:15:31.978Z",
+        isSidechain: false,
+        cwd: "/tmp",
+        attachment: {
+          type: "date_change",
+          newDate: "2026-05-13",
+        },
+      } as SessionEvent,
+    ];
+
+    const result = analyzeNetworkTab(new SessionTree(events));
+    const main = result.scopes.find((s) => s.id === "main");
+    expect(main).toBeDefined();
+    const atts = main!.events.filter((e) => e.kind === "attachment");
+    expect(atts).toHaveLength(3);
+
+    const tools = atts.find((a) => a.attachmentType === "deferred_tools_delta")!;
+    expect(tools.summary).toBe("Tools: +2 -0");
+    expect(tools.content).toContain("WebFetch");
+    expect(tools.content).toContain("WebSearch");
+
+    const skills = atts.find((a) => a.attachmentType === "skill_listing")!;
+    expect(skills.summary).toBe("Skills listed (2)");
+    expect(skills.content).toContain("skill-a");
+
+    const date = atts.find((a) => a.attachmentType === "date_change")!;
+    expect(date.summary).toBe("Date change: 2026-05-13");
+  });
 });

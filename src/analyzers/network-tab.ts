@@ -4,13 +4,19 @@ import type {
   UserEvent,
   ProgressEvent,
   SystemEvent,
+  AttachmentEvent,
   SessionEvent,
   NetworkAgentScope,
   NetworkRequestEntry,
   NetworkTimelineEvent,
   NetworkEventKind,
 } from "../types.js";
-import { toDisplayText, getScopeId } from "./utils.js";
+import {
+  toDisplayText,
+  extractContentParts,
+  getScopeId,
+  sanitizeMetadata,
+} from "./utils.js";
 
 interface NetworkTabResult {
   scopes: NetworkAgentScope[];
@@ -123,6 +129,7 @@ function buildTimelineEvents(
     const ae = event as AssistantEvent;
     const scopeId = getScopeId(ae);
     const reqId = ae.requestId ?? ae.uuid;
+    const requestMeta = buildAssistantRequestMeta(ae);
     for (const block of ae.message.content) {
       if (block.type === "thinking") {
         const preview = block.thinking.slice(0, 200);
@@ -138,6 +145,7 @@ function buildTimelineEvents(
           cacheCreationTokens: ae.message.usage.cache_creation_input_tokens,
           cacheReadTokens: ae.message.usage.cache_read_input_tokens,
           requestId: reqId,
+          ...requestMeta,
         });
       } else if (block.type === "text") {
         const preview = block.text.slice(0, 200);
@@ -153,6 +161,8 @@ function buildTimelineEvents(
           cacheCreationTokens: ae.message.usage.cache_creation_input_tokens,
           cacheReadTokens: ae.message.usage.cache_read_input_tokens,
           requestId: reqId,
+          isError: ae.isApiErrorMessage === true,
+          ...requestMeta,
         });
       } else if (block.type === "tool_use") {
         const linkedSubagentId =
@@ -174,6 +184,21 @@ function buildTimelineEvents(
           toolInput: block.input,
           toolResultContent: null,
           requestId: reqId,
+          ...requestMeta,
+        });
+      } else if (block.type === "fallback") {
+        const from = block.from?.model ?? "unknown";
+        const to = block.to?.model ?? "unknown";
+        results.push({
+          id: `fallback-${ae.uuid}-${counter++}`,
+          kind: "system",
+          timestamp: ae.timestamp,
+          scopeId,
+          summary: `Model fallback: ${from} → ${to}`,
+          content: `Switched from ${from} to ${to}`,
+          subtype: "model_fallback",
+          requestId: reqId,
+          systemData: { from, to },
         });
       }
     }
@@ -193,21 +218,26 @@ function buildTimelineEvents(
         content: text,
       });
     } else if (Array.isArray(ue.message.content)) {
-      // Tool results - match them back to existing tool_use events in the scope
-      for (const block of ue.message.content) {
-        if (block.type === "tool_result") {
-          // tool_result data is merged into the matching tool_use event
-          // via mergeToolResults() after all events are collected.
-        } else if (block.type === "text") {
-          results.push({
-            id: `user-text-${ue.uuid}-${counter++}`,
-            kind: "user_message",
-            timestamp: ue.timestamp,
-            scopeId,
-            summary: (block as any).text?.split("\n")[0]?.slice(0, 80) || "User text",
-            content: (block as any).text ?? "",
-          });
-        }
+      // Combine text, pasted images, and attached documents into one row.
+      // tool_result blocks are merged into the matching tool_use event
+      // via mergeToolResults() after all events are collected.
+      const nonToolBlocks = ue.message.content.filter(
+        (block) => block.type !== "tool_result"
+      );
+      if (nonToolBlocks.length > 0) {
+        const { text, images } = extractContentParts(nonToolBlocks);
+        const summary =
+          text.split("\n")[0]?.slice(0, 80) ||
+          (images.length > 0 ? `Image (${images.length})` : "User message");
+        results.push({
+          id: `user-text-${ue.uuid}-${counter++}`,
+          kind: "user_message",
+          timestamp: ue.timestamp,
+          scopeId,
+          summary,
+          content: text,
+          images: images.length > 0 ? images : undefined,
+        });
       }
     }
   } else if (event.type === "progress") {
@@ -237,13 +267,13 @@ function buildTimelineEvents(
     });
   } else if (event.type === "system") {
     const se = event as SystemEvent;
-    const scopeId = se.isSidechain ? "unknown" : "main";
+    const scopeId = getScopeId(se);
     const subtype = se.subtype ?? "system";
-    const durationMs = (se as any).durationMs ?? undefined;
+    const durationMs = se.durationMs ?? undefined;
 
     if (subtype === "compact_boundary") {
-      const preTokens = se.compactMetadata?.preTokens ?? undefined;
-      const trigger = se.compactMetadata?.trigger ?? undefined;
+      const meta = se.compactMetadata;
+      const trigger = meta?.trigger ?? undefined;
       // Resolve compaction subagent via logicalParentUuid → agentId
       const logicalParent = se.logicalParentUuid;
       const linkedSubagentId = logicalParent
@@ -258,24 +288,401 @@ function buildTimelineEvents(
         content: se.content ?? "Conversation compacted",
         subtype,
         compactTrigger: trigger,
-        preTokens,
+        preTokens: meta?.preTokens ?? undefined,
+        postTokens: meta?.postTokens ?? undefined,
+        droppedTokens: meta?.cumulativeDroppedTokens ?? undefined,
+        durationMs: meta?.durationMs ?? undefined,
         linkedSubagentId,
       });
     } else {
+      const { summary, content, systemData } = summarizeSystemEvent(se, subtype, durationMs);
       results.push({
         id: `system-${se.uuid}-${counter}`,
         kind: "system",
         timestamp: se.timestamp,
         scopeId,
-        summary: subtype,
-        content: se.content ?? (durationMs ? `Turn duration: ${durationMs}ms` : subtype),
+        summary,
+        content,
         subtype,
         durationMs,
+        systemData,
       });
     }
+  } else if (event.type === "attachment") {
+    results.push(buildAttachmentTimelineEvent(event as AttachmentEvent, counter));
+  } else if (event.type === "queue-operation") {
+    const text = event.content ?? "";
+    const firstLine = text.split("\n").find((l) => l.trim().length > 0) ?? "";
+    results.push({
+      id: `queue-${event.timestamp}-${counter}`,
+      kind: "system",
+      timestamp: event.timestamp,
+      scopeId: "main",
+      summary: `Queue ${event.operation}${firstLine ? `: ${firstLine.slice(0, 60)}` : ""}`,
+      content: text || event.operation,
+      subtype: "queue_operation",
+      systemData: { operation: event.operation },
+    });
+  } else if (event.type === "pr-link") {
+    const repo = event.prRepository ?? "";
+    const label = `PR #${event.prNumber ?? "?"}${repo ? ` — ${repo}` : ""}`;
+    results.push({
+      id: `pr-link-${event.timestamp}-${counter}`,
+      kind: "system",
+      timestamp: event.timestamp,
+      scopeId: "main",
+      summary: `Pull request created: ${label}`,
+      content: event.prUrl ?? label,
+      subtype: "pr_link",
+      systemData: {
+        prNumber: event.prNumber,
+        prUrl: event.prUrl,
+        prRepository: event.prRepository,
+      },
+    });
+  } else if (event.type === "frame-link") {
+    results.push({
+      id: `frame-link-${event.timestamp}-${counter}`,
+      kind: "system",
+      timestamp: event.timestamp,
+      scopeId: "main",
+      summary: `Artifact published${event.title ? `: ${event.title}` : ""}`,
+      content: event.frameUrl ?? event.path ?? "Artifact published",
+      subtype: "frame_link",
+      systemData: {
+        title: event.title,
+        frameUrl: event.frameUrl,
+        path: event.path,
+      },
+    });
   }
 
   return results;
+}
+
+/** Request-level metadata shared by every row emitted from one assistant event. */
+function buildAssistantRequestMeta(ae: AssistantEvent): Partial<NetworkTimelineEvent> {
+  const meta: Partial<NetworkTimelineEvent> = {};
+  if (ae.message.model) meta.model = ae.message.model;
+  if (ae.effort) meta.effort = ae.effort;
+  if (ae.attributionSkill) meta.attributionSkill = ae.attributionSkill;
+  if (ae.attributionAgent) meta.attributionAgent = ae.attributionAgent;
+  if (ae.attributionMcpServer) meta.attributionMcpServer = ae.attributionMcpServer;
+  const miss = ae.message.diagnostics?.cache_miss_reason;
+  if (miss && typeof miss.type === "string") {
+    meta.cacheMissReason = {
+      type: miss.type,
+      tokens:
+        typeof miss.cache_missed_input_tokens === "number"
+          ? miss.cache_missed_input_tokens
+          : undefined,
+    };
+  }
+  if (ae.isApiErrorMessage) {
+    meta.apiError = ae.error ?? "api_error";
+    meta.apiErrorStatus = ae.apiErrorStatus ?? undefined;
+  }
+  return meta;
+}
+
+/** Friendly summaries for non-compaction system subtypes. */
+function summarizeSystemEvent(
+  se: SystemEvent,
+  subtype: string,
+  durationMs: number | undefined
+): { summary: string; content: string; systemData?: Record<string, unknown> } {
+  const raw = se as unknown as Record<string, unknown>;
+
+  if (subtype === "turn_duration") {
+    const messageCount = se.messageCount;
+    const parts = [
+      durationMs != null ? `Turn took ${(durationMs / 1000).toFixed(1)}s` : "Turn duration",
+      messageCount != null ? `${messageCount} messages` : null,
+    ].filter(Boolean);
+    return { summary: parts.join(" · "), content: parts.join(" · ") };
+  }
+
+  if (subtype === "away_summary") {
+    const text = se.content ?? "";
+    return {
+      summary: `Recap: ${text.split("\n")[0]?.slice(0, 70) ?? ""}`,
+      content: text,
+    };
+  }
+
+  if (subtype === "model_refusal_fallback") {
+    const from = typeof raw.originalModel === "string" ? raw.originalModel : "?";
+    const to = typeof raw.fallbackModel === "string" ? raw.fallbackModel : "?";
+    return {
+      summary: `Model fallback (refusal): ${from} → ${to}`,
+      content: se.content ?? `Switched from ${from} to ${to} after a safeguards refusal`,
+      systemData: pickKeys(raw, [
+        "trigger",
+        "direction",
+        "originalModel",
+        "fallbackModel",
+        "apiRefusalCategory",
+        "apiRefusalExplanation",
+        "retractedMessageUuids",
+      ]),
+    };
+  }
+
+  if (subtype === "stop_hook_summary") {
+    const hookCount = typeof raw.hookCount === "number" ? raw.hookCount : undefined;
+    const prevented = raw.preventedContinuation === true;
+    return {
+      summary: `Stop hook${hookCount != null ? ` (${hookCount})` : ""}${prevented ? " — prevented stop" : ""}`,
+      content: se.content ?? "Stop hook ran",
+      systemData: pickKeys(raw, [
+        "hookCount",
+        "hookInfos",
+        "hookErrors",
+        "hookAdditionalContext",
+        "preventedContinuation",
+        "stopReason",
+      ]),
+    };
+  }
+
+  return {
+    summary: subtype,
+    content:
+      se.content ?? (durationMs ? `Turn duration: ${durationMs}ms` : subtype),
+  };
+}
+
+function pickKeys(
+  source: Record<string, unknown>,
+  keys: string[]
+): Record<string, unknown> | undefined {
+  const out: Record<string, unknown> = {};
+  for (const key of keys) {
+    if (source[key] !== undefined && source[key] !== null) out[key] = source[key];
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Map an "attachment" event (newer Claude Code shape) onto a timeline row.
+ * Hook payloads (hook_success / hook_additional_context) reuse the existing
+ * "hook" kind; everything else becomes a generic "attachment" row whose
+ * subtype is carried in `attachmentType`.
+ */
+function buildAttachmentTimelineEvent(
+  event: AttachmentEvent,
+  counter: number
+): NetworkTimelineEvent {
+  const scopeId = getScopeId(event);
+  const att = event.attachment ?? { type: "unknown" };
+  const subtype = typeof att.type === "string" ? att.type : "unknown";
+  const id = `attachment-${event.uuid}-${counter}`;
+
+  if (subtype === "hook_success") {
+    const hookName = typeof att.hookName === "string" ? att.hookName : "hook";
+    const hookEvent = typeof att.hookEvent === "string" ? att.hookEvent : undefined;
+    const command = typeof att.command === "string" ? att.command : "";
+    const stdout = typeof att.stdout === "string" ? att.stdout : "";
+    const stderr = typeof att.stderr === "string" ? att.stderr : "";
+    const exitCode = typeof att.exitCode === "number" ? att.exitCode : undefined;
+    const durationMs = typeof att.durationMs === "number" ? att.durationMs : undefined;
+    const content = stdout || (typeof att.content === "string" ? att.content : "");
+    return {
+      id,
+      kind: "hook",
+      timestamp: event.timestamp,
+      scopeId,
+      summary: hookName,
+      content: content || command || hookName,
+      hookEvent,
+      hookName,
+      progressType: "hook_success",
+      durationMs,
+      hookCommand: command,
+      hookStdout: stdout,
+      hookStderr: stderr,
+      hookExitCode: exitCode,
+    };
+  }
+
+  if (subtype === "hook_additional_context") {
+    const hookName = typeof att.hookName === "string" ? att.hookName : "hook";
+    const hookEvent = typeof att.hookEvent === "string" ? att.hookEvent : undefined;
+    const content = Array.isArray(att.content)
+      ? att.content.filter((c): c is string => typeof c === "string").join("\n\n")
+      : typeof att.content === "string"
+        ? att.content
+        : "";
+    return {
+      id,
+      kind: "hook",
+      timestamp: event.timestamp,
+      scopeId,
+      summary: `${hookName} (context)`,
+      content: content || hookName,
+      hookEvent,
+      hookName,
+      progressType: "hook_additional_context",
+    };
+  }
+
+  // Generic attachment: derive a friendly summary + content from the subtype.
+  const { summary, content } = summarizeAttachment(subtype, att);
+  return {
+    id,
+    kind: "attachment",
+    timestamp: event.timestamp,
+    scopeId,
+    summary,
+    content,
+    attachmentType: subtype,
+    attachmentData: att as Record<string, unknown>,
+  };
+}
+
+function summarizeAttachment(
+  subtype: string,
+  att: Record<string, unknown>
+): { summary: string; content: string } {
+  const str = (v: unknown): string => (typeof v === "string" ? v : "");
+  const num = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
+  const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+
+  switch (subtype) {
+    case "deferred_tools_delta": {
+      const added = arr(att.addedNames);
+      const removed = arr(att.removedNames);
+      return {
+        summary: `Tools: +${added.length} -${removed.length}`,
+        content:
+          (added.length ? `Added:\n${added.join("\n")}\n` : "") +
+          (removed.length ? `\nRemoved:\n${removed.join("\n")}` : ""),
+      };
+    }
+    case "agent_listing_delta": {
+      const added = arr(att.addedTypes);
+      const lines = arr(att.addedLines);
+      return {
+        summary: `Agents: +${added.length}`,
+        content: lines.length
+          ? lines.map((l) => str(l)).join("\n")
+          : added.map((t) => str(t)).join("\n"),
+      };
+    }
+    case "mcp_instructions_delta": {
+      const added = arr(att.addedNames);
+      const blocks = arr(att.addedBlocks);
+      return {
+        summary: `MCP instructions: ${added.map((n) => str(n)).join(", ") || added.length}`,
+        content: blocks.map((b) => str(b)).join("\n\n"),
+      };
+    }
+    case "goal_status": {
+      const met = att.met === true;
+      const condition = str(att.condition);
+      return {
+        summary: `Goal ${met ? "met" : "not met"}`,
+        content: condition || JSON.stringify(att, null, 2),
+      };
+    }
+    case "ultrathink_effort":
+      return {
+        summary: "Ultrathink effort",
+        content: "Extended thinking effort raised for this turn",
+      };
+    case "skill_listing": {
+      const count = num(att.skillCount);
+      return {
+        summary: `Skills listed${count != null ? ` (${count})` : ""}`,
+        content: str(att.content),
+      };
+    }
+    case "invoked_skills": {
+      const skills = arr(att.skills);
+      return {
+        summary: `Skills invoked (${skills.length})`,
+        content: JSON.stringify(skills, null, 2),
+      };
+    }
+    case "task_reminder": {
+      const itemCount = num(att.itemCount);
+      return {
+        summary: `Task reminder${itemCount != null ? ` (${itemCount})` : ""}`,
+        content:
+          typeof att.content === "string"
+            ? att.content
+            : JSON.stringify(att.content ?? null, null, 2),
+      };
+    }
+    case "queued_command": {
+      const prompt = str(att.prompt);
+      return {
+        summary: `Queued command${att.commandMode ? ` (${str(att.commandMode)})` : ""}`,
+        content: prompt,
+      };
+    }
+    case "plan_mode":
+      return {
+        summary: `Plan mode${att.reminderType ? ` (${str(att.reminderType)})` : ""}`,
+        content: `planFilePath: ${str(att.planFilePath)}\nplanExists: ${String(att.planExists)}\nisSubAgent: ${String(att.isSubAgent)}`,
+      };
+    case "plan_mode_exit":
+      return {
+        summary: "Plan mode exit",
+        content: `planFilePath: ${str(att.planFilePath)}\nplanExists: ${String(att.planExists)}`,
+      };
+    case "plan_mode_reentry":
+      return {
+        summary: "Plan mode reentry",
+        content: `planFilePath: ${str(att.planFilePath)}`,
+      };
+    case "plan_file_reference":
+      return {
+        summary: `Plan: ${basename(str(att.planFilePath))}`,
+        content: `Path: ${str(att.planFilePath)}\n\n${str(att.planContent)}`,
+      };
+    case "file":
+      return {
+        summary: `File: ${str(att.displayPath) || basename(str(att.filename))}`,
+        content:
+          typeof att.content === "string"
+            ? att.content
+            : JSON.stringify(att.content ?? null, null, 2),
+      };
+    case "compact_file_reference":
+      return {
+        summary: `File ref: ${str(att.displayPath) || basename(str(att.filename))}`,
+        content: `filename: ${str(att.filename)}\ndisplayPath: ${str(att.displayPath)}`,
+      };
+    case "edited_text_file":
+      return {
+        summary: `Edited: ${basename(str(att.filename))}`,
+        content: `${str(att.filename)}\n\n${str(att.snippet)}`,
+      };
+    case "date_change":
+      return {
+        summary: `Date change: ${str(att.newDate)}`,
+        content: `New date: ${str(att.newDate)}`,
+      };
+    case "command_permissions": {
+      const allowed = arr(att.allowedTools);
+      return {
+        summary: `Permissions: ${allowed.length} allowed`,
+        content: allowed.join("\n"),
+      };
+    }
+    default:
+      return {
+        summary: subtype,
+        content: JSON.stringify(att, null, 2),
+      };
+  }
+}
+
+function basename(p: string): string {
+  if (!p) return "";
+  const idx = p.lastIndexOf("/");
+  return idx >= 0 ? p.slice(idx + 1) : p;
 }
 
 /**
@@ -308,10 +715,15 @@ function mergeToolResults(
   for (const pair of tree.getToolPairs()) {
     const te = toolUseMap.get(pair.toolUse.id);
     if (te && pair.toolResult) {
+      const { text, images } = extractContentParts(pair.toolResult.content);
       te.isError = pair.toolResult.is_error ?? false;
-      te.toolResultContent = toDisplayText(pair.toolResult.content);
+      te.toolResultContent = text;
+      te.toolResultImages = images.length > 0 ? images : undefined;
       te.timeMs = computeTimeMs(pair.assistantTimestamp, pair.resultTimestamp);
-      te.toolUseResult = toolUseResultMap.get(pair.toolUse.id) ?? undefined;
+      const meta = toolUseResultMap.get(pair.toolUse.id);
+      te.toolUseResult = meta
+        ? (sanitizeMetadata(meta) as Record<string, unknown>)
+        : undefined;
     }
   }
 }

@@ -1,8 +1,8 @@
 import { createServer } from "node:http";
 import { createReadStream } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { readdir, stat } from "node:fs/promises";
-import { extname, join } from "node:path";
+import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import { homedir } from "node:os";
@@ -29,6 +29,63 @@ export interface RunningWebServer {
   close: () => Promise<void>;
 }
 
+function configPath(): string {
+  return (
+    process.env.CCEXPLORER_CONFIG_PATH ??
+    join(homedir(), ".claude", "ccexplorer-config.json")
+  );
+}
+
+interface CcExplorerConfig {
+  sessionDirs: string[];
+}
+
+async function readConfig(): Promise<CcExplorerConfig> {
+  try {
+    const raw = await readFile(configPath(), "utf-8");
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed.sessionDirs)) {
+      return { sessionDirs: parsed.sessionDirs };
+    }
+  } catch {
+    // missing or malformed config
+  }
+  return { sessionDirs: [] };
+}
+
+async function writeConfig(config: CcExplorerConfig): Promise<void> {
+  await mkdir(dirname(configPath()), { recursive: true });
+  await writeFile(configPath(), JSON.stringify(config, null, 2), "utf-8");
+}
+
+async function discoverAllSessions(
+  defaultDir: string
+): Promise<SessionCatalogEntry[]> {
+  const config = await readConfig();
+  const dirs = [defaultDir, ...config.sessionDirs.map((d) => join(d, "projects"))];
+  const seen = new Set<string>();
+  const allEntries: SessionCatalogEntry[] = [];
+  for (const dir of dirs) {
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    const entries = await discoverSessions(dir);
+    allEntries.push(...entries);
+  }
+  // The same session file can exist under multiple roots (e.g. ~/.claude and
+  // ~/.claude-personal). Keep only the most recently modified copy.
+  const byIdentity = new Map<string, SessionCatalogEntry>();
+  for (const entry of allEntries) {
+    const identity = `${entry.projectName}/${entry.fileName}`;
+    const existing = byIdentity.get(identity);
+    if (!existing || (entry.mtimeMs ?? 0) > (existing.mtimeMs ?? 0)) {
+      byIdentity.set(identity, entry);
+    }
+  }
+  return [...byIdentity.values()].sort(
+    (a, b) => (b.mtimeMs ?? 0) - (a.mtimeMs ?? 0)
+  );
+}
+
 export async function startWebServer(
   options: StartWebServerOptions
 ): Promise<RunningWebServer> {
@@ -40,7 +97,7 @@ export async function startWebServer(
     initialSessionPath,
   } = options;
 
-  let catalog = await discoverSessions(sessionsRootDir);
+  let catalog = await discoverAllSessions(sessionsRootDir);
   let catalogTimestamp = Date.now();
   const CATALOG_TTL_MS = 5000;
   const cache = new Map<string, { mtimeMs: number; analysis: Awaited<ReturnType<typeof analyzeSessionPath>> }>();
@@ -75,10 +132,36 @@ export async function startWebServer(
 
     if (url.pathname === "/api/sessions") {
       if (Date.now() - catalogTimestamp > CATALOG_TTL_MS) {
-        catalog = await discoverSessions(sessionsRootDir);
+        catalog = await discoverAllSessions(sessionsRootDir);
         catalogTimestamp = Date.now();
       }
       return json(res, 200, catalog);
+    }
+
+    if (url.pathname === "/api/session-dirs") {
+      if (req.method === "GET") {
+        const config = await readConfig();
+        return json(res, 200, {
+          defaultDir: dirname(sessionsRootDir),
+          extraDirs: config.sessionDirs,
+        });
+      }
+      if (req.method === "POST") {
+        const body = await readBody(req);
+        const parsed = JSON.parse(body);
+        if (!Array.isArray(parsed.dirs)) {
+          return json(res, 400, { error: "Expected { dirs: string[] }" });
+        }
+        const config: CcExplorerConfig = { sessionDirs: parsed.dirs };
+        await writeConfig(config);
+        // Force catalog refresh
+        catalog = await discoverAllSessions(sessionsRootDir);
+        catalogTimestamp = Date.now();
+        return json(res, 200, {
+          defaultDir: dirname(sessionsRootDir),
+          extraDirs: config.sessionDirs,
+        });
+      }
     }
 
     const analysis = selectedKey
@@ -213,6 +296,15 @@ function json(
   res.end(JSON.stringify(body));
 }
 
+function readBody(req: import("node:http").IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+    req.on("error", reject);
+  });
+}
+
 async function serveFile(
   res: import("node:http").ServerResponse,
   filePath: string
@@ -251,26 +343,81 @@ function sessionEntryFromPath(filePath: string, sessionKey: string) {
   };
 }
 
-/** Read just enough of a JSONL to find the first user text message. */
-async function extractFirstUserMessage(
-  filePath: string
-): Promise<string | null> {
+interface SessionMeta {
+  firstUserMessage?: string;
+  aiTitle?: string;
+  agentName?: string;
+  lastPrompt?: string;
+}
+
+interface SessionCatalogEntry extends SessionMeta {
+  sessionKey: string;
+  fileName: string;
+  projectName: string;
+  fullPath: string;
+  mtimeMs?: number;
+}
+
+// Session meta requires a full-file scan (ai-title is updated over the life of
+// a session, so the last occurrence wins). Cache per path+mtime so the catalog
+// refresh only re-reads files that changed.
+const sessionMetaCache = new Map<string, { mtimeMs: number; meta: SessionMeta }>();
+
+/** True for user messages that are harness noise rather than a real prompt. */
+function isNoiseUserMessage(text: string): boolean {
+  const trimmed = text.trimStart();
+  return (
+    trimmed.startsWith("<local-command-caveat>") ||
+    trimmed.startsWith("Caveat: The messages below") ||
+    trimmed.startsWith("<command-name>") ||
+    trimmed.startsWith("<command-message>") ||
+    trimmed.startsWith("<task-notification>") ||
+    trimmed.startsWith("<system-reminder>")
+  );
+}
+
+/**
+ * Scan a session JSONL once, collecting the first real user prompt and the
+ * latest ai-title / agent-name / last-prompt sidecar records.
+ */
+async function extractSessionMeta(
+  filePath: string,
+  mtimeMs: number
+): Promise<SessionMeta> {
+  const cached = sessionMetaCache.get(filePath);
+  if (cached && cached.mtimeMs === mtimeMs) return cached.meta;
+
+  const meta: SessionMeta = {};
   try {
     const stream = createReadStream(filePath, { encoding: "utf-8" });
     const rl = createInterface({ input: stream, crlfDelay: Infinity });
     for await (const line of rl) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
+      // Cheap substring pre-filter before parsing
+      const wantsUser =
+        meta.firstUserMessage === undefined && line.includes('"type":"user"');
+      const wantsSidecar =
+        line.includes('"type":"ai-title"') ||
+        line.includes('"type":"agent-name"') ||
+        line.includes('"type":"last-prompt"');
+      if (!wantsUser && !wantsSidecar) continue;
       try {
-        const parsed = JSON.parse(trimmed);
+        const parsed = JSON.parse(line);
         if (
+          wantsUser &&
           parsed.type === "user" &&
+          !parsed.isSidechain &&
+          !parsed.isMeta &&
           typeof parsed.message?.content === "string" &&
-          parsed.message.content.trim().length > 0
+          parsed.message.content.trim().length > 0 &&
+          !isNoiseUserMessage(parsed.message.content)
         ) {
-          rl.close();
-          stream.destroy();
-          return parsed.message.content.trim();
+          meta.firstUserMessage = parsed.message.content.trim();
+        } else if (parsed.type === "ai-title" && typeof parsed.aiTitle === "string") {
+          meta.aiTitle = parsed.aiTitle;
+        } else if (parsed.type === "agent-name" && typeof parsed.agentName === "string") {
+          meta.agentName = parsed.agentName;
+        } else if (parsed.type === "last-prompt" && typeof parsed.lastPrompt === "string") {
+          meta.lastPrompt = parsed.lastPrompt;
         }
       } catch {
         // skip malformed
@@ -279,28 +426,14 @@ async function extractFirstUserMessage(
   } catch {
     // file not readable
   }
-  return null;
+
+  sessionMetaCache.set(filePath, { mtimeMs, meta });
+  return meta;
 }
 
-async function discoverSessions(rootDir: string): Promise<
-  Array<{
-    sessionKey: string;
-    fileName: string;
-    projectName: string;
-    fullPath: string;
-    mtimeMs?: number;
-    firstUserMessage?: string;
-  }>
-> {
+async function discoverSessions(rootDir: string): Promise<SessionCatalogEntry[]> {
   const projects = await readdir(rootDir).catch(() => []);
-  const entries: Array<{
-    sessionKey: string;
-    fileName: string;
-    projectName: string;
-    fullPath: string;
-    mtimeMs?: number;
-    firstUserMessage?: string;
-  }> = [];
+  const entries: SessionCatalogEntry[] = [];
 
   for (const project of projects) {
     const projectPath = join(rootDir, project);
@@ -311,22 +444,19 @@ async function discoverSessions(rootDir: string): Promise<
       if (!file.endsWith(".jsonl")) continue;
       const fullPath = join(projectPath, file);
       const fileStat = await stat(fullPath).catch(() => null);
-      const firstUserMessage =
-        (await extractFirstUserMessage(fullPath)) ?? undefined;
+      const meta = await extractSessionMeta(fullPath, fileStat?.mtimeMs ?? 0);
       entries.push({
         sessionKey: sessionKeyFromPath(fullPath),
         fileName: file.replace(/\.jsonl$/, ""),
         projectName: project,
         fullPath,
         mtimeMs: fileStat?.mtimeMs,
-        firstUserMessage,
+        ...meta,
       });
     }
   }
 
-  return entries
-    .sort((a, b) => (b.mtimeMs ?? 0) - (a.mtimeMs ?? 0))
-    .map(({ mtimeMs: _mtimeMs, ...rest }) => rest);
+  return entries.sort((a, b) => (b.mtimeMs ?? 0) - (a.mtimeMs ?? 0));
 }
 
 function resolveSessionKey(

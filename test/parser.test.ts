@@ -60,6 +60,51 @@ describe("readJsonl", () => {
   });
 });
 
+describe("readJsonl attachment events", () => {
+  it("retains attachment events instead of dropping them", async () => {
+    const baseDir = await mkdtemp(path.join(tmpdir(), "cca-att-"));
+    const jsonlPath = path.join(baseDir, "session.jsonl");
+    const lines = [
+      JSON.stringify({
+        type: "attachment",
+        uuid: "att-1",
+        parentUuid: null,
+        sessionId: "s1",
+        timestamp: "2026-05-13T18:15:25.895Z",
+        isSidechain: false,
+        cwd: "/tmp",
+        attachment: {
+          type: "hook_success",
+          hookName: "SessionStart:startup",
+          hookEvent: "SessionStart",
+          stdout: "ok",
+          stderr: "",
+          exitCode: 0,
+          command: "echo ok",
+          durationMs: 12,
+          content: "ok",
+          toolUseID: "tu1",
+        },
+      }),
+      JSON.stringify({
+        type: "attachment",
+        uuid: "att-2",
+        parentUuid: "att-1",
+        sessionId: "s1",
+        timestamp: "2026-05-13T18:15:26.000Z",
+        isSidechain: false,
+        cwd: "/tmp",
+        attachment: { type: "date_change", newDate: "2026-05-13" },
+      }),
+    ];
+    await writeFile(jsonlPath, lines.join("\n"), "utf-8");
+
+    const events = await readJsonl(jsonlPath);
+    expect(events).toHaveLength(2);
+    expect(events.every((e) => e.type === "attachment")).toBe(true);
+  });
+});
+
 describe("readSessionBundle", () => {
   it("loads main session plus subagent jsonl files", async () => {
     const baseDir = await mkdtemp(path.join(tmpdir(), "cca-bundle-"));

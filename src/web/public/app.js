@@ -8,6 +8,7 @@ const KIND_LABELS = {
   hook: "Hook",
   system: "System",
   compaction: "Compaction",
+  attachment: "Attachment",
 };
 
 const KIND_COLORS = {
@@ -18,6 +19,7 @@ const KIND_COLORS = {
   hook: "kind-hook",
   system: "kind-system",
   compaction: "kind-compaction",
+  attachment: "kind-attachment",
 };
 
 const state = {
@@ -184,8 +186,33 @@ function renderScopeButton(scope, isActive) {
   `;
 }
 
+function sessionTitle(session) {
+  return (
+    session.aiTitle ||
+    session.agentName ||
+    session.firstUserMessage ||
+    session.fileName
+  );
+}
+
 function formatSessionLabel(session) {
-  return `${session.projectName}/${session.fileName}`;
+  const title = session.aiTitle || session.agentName;
+  return title
+    ? `${session.projectName}: ${title}`
+    : `${session.projectName}/${session.fileName}`;
+}
+
+function relativeTime(ms) {
+  if (!ms) return "";
+  const diff = Date.now() - ms;
+  if (diff < 60_000) return "just now";
+  const minutes = Math.floor(diff / 60_000);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 14) return `${days}d ago`;
+  return new Date(ms).toLocaleDateString();
 }
 
 function updateSessionTriggerLabel(sessions) {
@@ -226,8 +253,18 @@ function renderSessionModalList(sessions) {
   const query = state.sessionSearchQuery.trim().toLowerCase();
   const filteredSessions = query
     ? sessions.filter((session) => {
-        const prompt = session.firstUserMessage ?? "";
-        const haystack = `${session.projectName ?? ""} ${session.fileName ?? ""} ${prompt} ${session.sessionKey ?? ""}`.toLowerCase();
+        const haystack = [
+          session.projectName,
+          session.fileName,
+          session.aiTitle,
+          session.agentName,
+          session.firstUserMessage,
+          session.lastPrompt,
+          session.sessionKey,
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
         return haystack.includes(query);
       })
     : sessions;
@@ -247,14 +284,16 @@ function renderSessionModalList(sessions) {
           const items = projectSessions
             .map((session) => {
               const isActive = session.sessionKey === state.sessionKey;
-              const prompt = session.firstUserMessage
-                ? session.firstUserMessage.slice(0, 120) + (session.firstUserMessage.length > 120 ? "…" : "")
-                : session.fileName;
+              const rawTitle = sessionTitle(session);
+              const title =
+                rawTitle.slice(0, 120) + (rawTitle.length > 120 ? "…" : "");
+              const date = relativeTime(session.mtimeMs);
               return `
                 <button class="session-option ${isActive ? "active" : ""}" data-session-option="${session.sessionKey}">
                   <div class="session-option-header">
-                    <span class="session-option-title">${escapeHtml(prompt)}</span>
+                    <span class="session-option-title">${escapeHtml(title)}</span>
                     ${isActive ? '<span class="session-option-badge">Active</span>' : ""}
+                    ${date ? `<span class="session-option-date">${escapeHtml(date)}</span>` : ""}
                   </div>
                   <div class="session-option-meta">${escapeHtml(session.fileName)}</div>
                 </button>
@@ -270,6 +309,12 @@ function renderSessionModalList(sessions) {
       await switchSession(nextKey, sessions);
     });
   }
+}
+
+function extractHttpUrl(text) {
+  if (typeof text !== "string") return null;
+  const match = text.match(/https?:\/\/[^\s"'<>]+/);
+  return match ? match[0] : null;
 }
 
 function detailValue(value) {
@@ -517,22 +562,52 @@ function ctxTotalText(turn) {
 }
 
 
+function cacheMissTitle(evt) {
+  if (!evt.cacheMissReason) return "";
+  const tokens = evt.cacheMissReason.tokens;
+  const detail = tokens != null ? ` — ${tokens.toLocaleString()} tokens re-read` : "";
+  return `Cache miss: ${evt.cacheMissReason.type}${detail}`;
+}
+
+function ctxCell(evt, tokens, isDuplicateRequest) {
+  const dupTooltip = "Additional context is shared with the previous row showing context usage";
+  if (isDuplicateRequest) return `<span class="dup-token" title="${dupTooltip}">↑</span>`;
+  const missTitle = cacheMissTitle(evt);
+  if (missTitle && tokens) {
+    return `<span class="ctx-miss" title="${escapeHtml(missTitle)}">${ctxText(tokens)}</span>`;
+  }
+  return ctxText(tokens);
+}
+
+function rowBadges(evt) {
+  const badges = [];
+  if (evt.linkedSubagentId) {
+    badges.push('<span class="kind-badge spawns-subagent-badge">Spawns Subagent</span>');
+  }
+  if (evt.apiError) {
+    badges.push(`<span class="kind-badge api-error-badge">${escapeHtml(evt.apiError)}</span>`);
+  }
+  if (evt.attributionSkill) {
+    badges.push(`<span class="kind-badge skill-badge" title="Produced by skill">${escapeHtml(evt.attributionSkill)}</span>`);
+  }
+  if (evt.images?.length || evt.toolResultImages?.length) {
+    badges.push('<span class="kind-badge image-badge">🖼</span>');
+  }
+  return badges.length > 0 ? ` ${badges.join(" ")}` : "";
+}
+
 function renderEventRow(evt, isSelected, contextTurn, isDuplicateRequest) {
   const kindClass = KIND_COLORS[evt.kind] || "";
   const errorClass = evt.isError ? "error" : "";
   const selectedClass = isSelected ? "selected" : "";
   const dupClass = isDuplicateRequest ? "duplicate-request" : "";
   const ctxPercent = ctxTotalText(contextTurn);
-
-  const subagentBadge = evt.linkedSubagentId
-    ? ' <span class="kind-badge spawns-subagent-badge">Spawns Subagent</span>'
-    : "";
+  const badges = rowBadges(evt);
 
   if (evt.kind === "tool_use") {
-    const dupTooltip = "Additional context is shared with the previous row showing context usage";
-    const ctxVal = isDuplicateRequest ? `<span class="dup-token" title="${dupTooltip}">↑</span>` : ctxText(evt.ctxSpikeTokens);
+    const ctxVal = ctxCell(evt, evt.ctxSpikeTokens, isDuplicateRequest);
     return `<tr class="row ${errorClass} ${selectedClass} ${kindClass} ${dupClass}" data-row="${evt.id}">
-      <td><span class="kind-badge kind-badge-tool_use">Tool</span>${subagentBadge} <span class="row-summary">${escapeHtml(evt.toolName)}</span></td>
+      <td><span class="kind-badge kind-badge-tool_use">Tool</span>${badges} <span class="row-summary">${escapeHtml(evt.toolName)}</span></td>
       <td>${timeText(evt.timeMs)}</td>
       <td>${ctxVal}</td>
       <td>${ctxPercent}</td>
@@ -543,10 +618,9 @@ function renderEventRow(evt, isSelected, contextTurn, isDuplicateRequest) {
   const kindLabel = KIND_LABELS[evt.kind] || evt.kind;
   const cacheTokens = evt.cacheCreationTokens ?? 0;
   const evtTime = evt.durationMs ? timeText(evt.durationMs) : "-";
-  const dupTooltip = "Additional context is shared with the previous row showing context usage";
-  const ctxVal = isDuplicateRequest ? `<span class="dup-token" title="${dupTooltip}">↑</span>` : ctxText(cacheTokens);
-  return `<tr class="row ${selectedClass} ${kindClass} ${dupClass}" data-row="${evt.id}">
-    <td><span class="kind-badge kind-badge-${evt.kind}">${escapeHtml(kindLabel)}</span>${subagentBadge} <span class="row-summary">${escapeHtml(evt.summary)}</span></td>
+  const ctxVal = ctxCell(evt, cacheTokens, isDuplicateRequest);
+  return `<tr class="row ${errorClass} ${selectedClass} ${kindClass} ${dupClass}" data-row="${evt.id}">
+    <td><span class="kind-badge kind-badge-${evt.kind}">${escapeHtml(kindLabel)}</span>${badges} <span class="row-summary">${escapeHtml(evt.summary)}</span></td>
     <td>${evtTime}</td>
     <td>${ctxVal}</td>
     <td>${ctxPercent}</td>
@@ -567,6 +641,16 @@ function renderContextInfo(evt, contextTurn) {
     parts.push(`<p><strong>Ctx+:</strong> ${ctxPlus.toLocaleString()} tokens</p>`);
   }
 
+  // Why the prompt cache missed (explains large Ctx+ spikes)
+  if (evt.cacheMissReason) {
+    const tokens = evt.cacheMissReason.tokens;
+    parts.push(
+      `<p><strong>Cache miss:</strong> ${escapeHtml(evt.cacheMissReason.type)}` +
+        (tokens != null ? ` — ${tokens.toLocaleString()} tokens re-read` : "") +
+        `</p>`
+    );
+  }
+
   // Total context with hover breakdown
   if (contextTurn) {
     const t = contextTurn;
@@ -580,6 +664,43 @@ function renderContextInfo(evt, contextTurn) {
   }
 
   return parts.join("\n");
+}
+
+/** Model / effort / attribution / API-error lines shared by assistant-derived panels. */
+function renderRequestMeta(evt) {
+  const parts = [];
+  if (evt.model) {
+    const effort = evt.effort ? ` (effort: ${escapeHtml(evt.effort)})` : "";
+    parts.push(`<p><strong>Model:</strong> ${escapeHtml(evt.model)}${effort}</p>`);
+  }
+  if (evt.attributionSkill) {
+    parts.push(`<p><strong>Skill:</strong> ${escapeHtml(evt.attributionSkill)}</p>`);
+  }
+  if (evt.attributionAgent) {
+    parts.push(`<p><strong>Agent:</strong> ${escapeHtml(evt.attributionAgent)}</p>`);
+  }
+  if (evt.attributionMcpServer) {
+    parts.push(`<p><strong>MCP server:</strong> ${escapeHtml(evt.attributionMcpServer)}</p>`);
+  }
+  if (evt.apiError) {
+    const status = evt.apiErrorStatus != null ? ` (HTTP ${evt.apiErrorStatus})` : "";
+    parts.push(
+      `<p><strong>API error:</strong> <span class="status-badge status-badge-error">${escapeHtml(evt.apiError)}${status}</span></p>`
+    );
+  }
+  return parts.join("\n");
+}
+
+/** Render inline images (data URIs) extracted from messages or tool results. */
+function renderImages(images, heading) {
+  if (!images || images.length === 0) return "";
+  const imgs = images
+    .map(
+      (img) =>
+        `<img class="detail-image" src="data:${escapeHtml(img.mediaType)};base64,${img.data}" alt="embedded image" loading="lazy" />`
+    )
+    .join("\n");
+  return `<h4>${escapeHtml(heading)} (${images.length})</h4><div class="detail-images">${imgs}</div>`;
 }
 
 function detailTimeBadge(evt) {
@@ -604,10 +725,13 @@ function renderDetailPanel(evt, contextTurn) {
   const timeBadge = detailTimeBadge(evt);
   const statusBadge = detailStatusBadge(evt);
 
+  const requestMeta = renderRequestMeta(evt);
+
   if (evt.kind === "tool_use") {
     return `
       <div class="detail-header"><h3>${escapeHtml(evt.toolName)} ${timeBadge}</h3>${statusBadge}</div>
       <p><strong>Use ID:</strong> ${escapeHtml(evt.toolUseId)}</p>
+      ${requestMeta}
       ${ctxInfo}
       ${evt.linkedSubagentId
         ? `<p><strong>Spawns subagent:</strong> <button class="subagent-link" data-jump-subagent="${evt.linkedSubagentId}">${evt.linkedSubagentId}</button></p>`
@@ -616,6 +740,7 @@ function renderDetailPanel(evt, contextTurn) {
       ${renderJsonViewer(evt.toolInput)}
       <h4>Result</h4>
       <pre>${escapeHtml(detailValue(evt.toolResultContent))}</pre>
+      ${renderImages(evt.toolResultImages, "Result images")}
       ${evt.toolUseResult ? `<h4>Metadata</h4>${renderJsonViewer(evt.toolUseResult)}` : ""}`;
   }
 
@@ -624,12 +749,14 @@ function renderDetailPanel(evt, contextTurn) {
       <h3>User Message ${timeBadge}</h3>
       ${ctxInfo}
       <h4>Content</h4>
-      <pre>${escapeHtml(evt.content)}</pre>`;
+      <pre>${escapeHtml(evt.content)}</pre>
+      ${renderImages(evt.images, "Images")}`;
   }
 
   if (evt.kind === "assistant_text") {
     return `
       <h3>Assistant Response ${timeBadge}</h3>
+      ${requestMeta}
       ${ctxInfo}
       <h4>Content</h4>
       <pre>${escapeHtml(evt.content)}</pre>`;
@@ -638,25 +765,56 @@ function renderDetailPanel(evt, contextTurn) {
   if (evt.kind === "thinking") {
     return `
       <h3>Thinking ${timeBadge}</h3>
+      ${requestMeta}
       ${ctxInfo}
       <h4>Content</h4>
       <pre>${escapeHtml(evt.content)}</pre>`;
   }
 
   if (evt.kind === "hook") {
+    const hookEventLine = evt.hookEvent ? `<p><strong>Hook event:</strong> ${escapeHtml(evt.hookEvent)}</p>` : "";
+    const cmdLine = evt.hookCommand ? `<p><strong>Command:</strong> ${escapeHtml(evt.hookCommand)}</p>` : "";
+    const exitLine = evt.hookExitCode != null ? `<p><strong>Exit code:</strong> ${evt.hookExitCode}</p>` : "";
+    const durLine = evt.durationMs != null ? `<p><strong>Duration:</strong> ${timeText(evt.durationMs)}</p>` : "";
+    const stderrBlock = evt.hookStderr
+      ? `<h4>stderr</h4><pre>${escapeHtml(evt.hookStderr)}</pre>`
+      : "";
     return `
       <h3>Hook ${timeBadge}</h3>
       ${evt.hookName ? `<p><strong>Hook name:</strong> ${escapeHtml(evt.hookName)}</p>` : ""}
+      ${hookEventLine}
+      ${cmdLine}
+      ${exitLine}
+      ${durLine}
       ${ctxInfo}
       <h4>Content</h4>
+      <pre>${escapeHtml(evt.content)}</pre>
+      ${stderrBlock}`;
+  }
+
+  if (evt.kind === "attachment") {
+    const subtypeLine = evt.attachmentType ? `<p><strong>Subtype:</strong> ${escapeHtml(evt.attachmentType)}</p>` : "";
+    return `
+      <h3>Attachment ${timeBadge}</h3>
+      ${subtypeLine}
+      ${ctxInfo}
+      <h4>${escapeHtml(evt.summary || "Content")}</h4>
       <pre>${escapeHtml(evt.content)}</pre>`;
   }
 
   if (evt.kind === "compaction") {
+    const freed =
+      evt.preTokens != null && evt.postTokens != null
+        ? evt.preTokens - evt.postTokens
+        : null;
     return `
       <h3>Context Compaction ${timeBadge}</h3>
       ${evt.compactTrigger ? `<p><strong>Trigger:</strong> ${escapeHtml(evt.compactTrigger)}</p>` : ""}
       ${evt.preTokens ? `<p><strong>Pre-compaction tokens:</strong> ${evt.preTokens.toLocaleString()}</p>` : ""}
+      ${evt.postTokens ? `<p><strong>Post-compaction tokens:</strong> ${evt.postTokens.toLocaleString()}</p>` : ""}
+      ${freed != null && freed > 0 ? `<p><strong>Freed:</strong> ${freed.toLocaleString()} tokens</p>` : ""}
+      ${evt.droppedTokens ? `<p><strong>Cumulative dropped:</strong> ${evt.droppedTokens.toLocaleString()} tokens</p>` : ""}
+      ${evt.durationMs ? `<p><strong>Compaction took:</strong> ${timeText(evt.durationMs)}</p>` : ""}
       ${ctxInfo}
       ${evt.linkedSubagentId
         ? `<p><strong>Compaction subagent:</strong> <button class="subagent-link" data-jump-subagent="${evt.linkedSubagentId}">${evt.linkedSubagentId}</button></p>`
@@ -666,13 +824,16 @@ function renderDetailPanel(evt, contextTurn) {
   }
 
   if (evt.kind === "system") {
+    const link = extractHttpUrl(evt.content);
     return `
       <h3>System Event ${timeBadge}</h3>
       ${evt.subtype ? `<p><strong>Subtype:</strong> ${escapeHtml(evt.subtype)}</p>` : ""}
       ${evt.durationMs ? `<p><strong>Duration:</strong> ${timeText(evt.durationMs)}</p>` : ""}
       ${ctxInfo}
       <h4>Content</h4>
-      <pre>${escapeHtml(evt.content)}</pre>`;
+      <pre>${escapeHtml(evt.content)}</pre>
+      ${link ? `<p><a class="detail-link" href="${escapeHtml(link)}" target="_blank" rel="noreferrer">${escapeHtml(link)}</a></p>` : ""}
+      ${evt.systemData ? `<h4>Details</h4>${renderJsonViewer(evt.systemData)}` : ""}`;
   }
 
   return `<p class="empty">Unknown event type.</p>`;
@@ -1090,10 +1251,11 @@ if (sessionModalCloseBtn) {
 if (sessionCopyBtn) {
   sessionCopyBtn.addEventListener("click", (e) => {
     e.stopPropagation();
-    const label = sessionCurrentLabel ? sessionCurrentLabel.textContent : "";
-    const slashIdx = label.indexOf("/");
-    const sessionId = slashIdx !== -1 ? label.slice(slashIdx + 1) : label;
-    if (!sessionId || sessionId === "Loading..." || sessionId === "No session") return;
+    const selected = currentSessions.find(
+      (session) => session.sessionKey === state.sessionKey
+    );
+    const sessionId = selected ? selected.fileName : "";
+    if (!sessionId) return;
     navigator.clipboard.writeText(sessionId).then(() => {
       sessionCopyBtn.classList.add("copied");
       setTimeout(() => sessionCopyBtn.classList.remove("copied"), 1500);
@@ -1115,10 +1277,124 @@ if (sessionModalSearchInput instanceof HTMLInputElement) {
 }
 
 window.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && sessionModalOpen) {
-    closeSessionModal();
+  if (event.key === "Escape") {
+    if (settingsModalOpen) closeSettingsModal();
+    else if (sessionModalOpen) closeSessionModal();
   }
 });
+
+// --- Settings modal for session directories ---
+const settingsBtn = document.getElementById("settings-btn");
+const settingsModal = document.getElementById("settings-modal");
+const settingsModalClose = document.getElementById("settings-modal-close");
+const settingsModalBackdrop = document.getElementById("settings-modal-backdrop");
+const settingsDefaultDir = document.getElementById("settings-default-dir");
+const settingsExtraDirs = document.getElementById("settings-extra-dirs");
+const settingsNewDir = document.getElementById("settings-new-dir");
+const settingsAddBtn = document.getElementById("settings-add-btn");
+let settingsModalOpen = false;
+let settingsDirState = { defaultDir: "", extraDirs: [] };
+
+function closeSettingsModal() {
+  if (settingsModal) settingsModal.classList.add("hidden");
+  settingsModalOpen = false;
+}
+
+function renderSettingsDirs() {
+  if (!settingsExtraDirs) return;
+  if (settingsDefaultDir) settingsDefaultDir.textContent = settingsDirState.defaultDir;
+  if (settingsDirState.extraDirs.length === 0) {
+    settingsExtraDirs.innerHTML = "";
+    return;
+  }
+  settingsExtraDirs.innerHTML = settingsDirState.extraDirs
+    .map((dir, i) => `
+      <div class="settings-dir-row">
+        <span class="settings-dir-label">Extra</span>
+        <code class="settings-dir-path" title="${escapeHtml(dir)}">${escapeHtml(dir)}</code>
+        <button class="settings-dir-remove" data-dir-index="${i}" title="Remove">&times;</button>
+      </div>
+    `)
+    .join("");
+  for (const btn of settingsExtraDirs.querySelectorAll(".settings-dir-remove")) {
+    btn.addEventListener("click", async () => {
+      const idx = Number(btn.getAttribute("data-dir-index"));
+      settingsDirState.extraDirs.splice(idx, 1);
+      await saveSettingsDirs();
+      renderSettingsDirs();
+    });
+  }
+}
+
+async function loadSettingsDirs() {
+  try {
+    const res = await fetch("/api/session-dirs");
+    if (res.ok) {
+      settingsDirState = await res.json();
+    }
+  } catch {
+    // ignore
+  }
+}
+
+async function saveSettingsDirs() {
+  try {
+    await fetch("/api/session-dirs", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ dirs: settingsDirState.extraDirs }),
+    });
+    // Refresh the session list
+    const sessionsRes = await fetch("/api/sessions");
+    if (sessionsRes.ok) {
+      currentSessions = await sessionsRes.json();
+      updateSessionTriggerLabel(currentSessions);
+      renderSessionModalList(currentSessions);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+async function openSettingsModal() {
+  if (!settingsModal) return;
+  await loadSettingsDirs();
+  renderSettingsDirs();
+  settingsModal.classList.remove("hidden");
+  settingsModalOpen = true;
+  if (settingsNewDir instanceof HTMLInputElement) settingsNewDir.focus();
+}
+
+if (settingsBtn) {
+  settingsBtn.addEventListener("click", () => openSettingsModal());
+}
+
+if (settingsModalClose) {
+  settingsModalClose.addEventListener("click", () => closeSettingsModal());
+}
+
+if (settingsModalBackdrop) {
+  settingsModalBackdrop.addEventListener("click", () => closeSettingsModal());
+}
+
+if (settingsAddBtn && settingsNewDir instanceof HTMLInputElement) {
+  async function addDir() {
+    const dir = settingsNewDir.value.trim();
+    if (!dir) return;
+    if (dir === settingsDirState.defaultDir || settingsDirState.extraDirs.includes(dir)) {
+      settingsNewDir.value = "";
+      return;
+    }
+    settingsDirState.extraDirs.push(dir);
+    settingsNewDir.value = "";
+    await saveSettingsDirs();
+    renderSettingsDirs();
+  }
+  settingsAddBtn.addEventListener("click", addDir);
+  settingsNewDir.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") addDir();
+  });
+}
 
 async function boot() {
   const sessionsRes = await fetch("/api/sessions");
@@ -1128,7 +1404,9 @@ async function boot() {
   }
   const sessions = await sessionsRes.json();
   if (sessions.length === 0) {
-    app.textContent = "No sessions found in ~/.claude/projects.";
+    app.innerHTML = 'No sessions found. Click the <button id="empty-settings-btn" class="nav-btn" style="display:inline;vertical-align:middle;width:auto;height:auto;padding:2px 6px;font-size:14px">&#9881;</button> button to add session directories.';
+    const emptySettingsBtn = document.getElementById("empty-settings-btn");
+    if (emptySettingsBtn) emptySettingsBtn.addEventListener("click", () => openSettingsModal());
     return;
   }
   const url = new URL(window.location.href);

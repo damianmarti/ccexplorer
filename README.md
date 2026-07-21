@@ -2,7 +2,7 @@
 
 A browser-based inspector for Claude Code JSONL session transcripts. Think Chrome DevTools' Network tab, but for understanding what Claude did during a coding session — every tool call, thinking block, context window shift, and subagent spawn laid out on a single interactive timeline.
 
-<img width="1914" height="911" alt="ClaudeCodeAnalysis" src="https://github.com/user-attachments/assets/c1ed2024-eeb2-4ae1-b4af-9d5391f83f45" />
+<img alt="Claude Code Session Explorer — timeline with agent scopes, badges, and detail panel" src="https://raw.githubusercontent.com/escottalexander/ccexplorer/main/docs/screenshot.jpg" />
 
 ## Why
 
@@ -47,18 +47,20 @@ The main view is a filterable table of every event in the session, ordered chron
 
 - **Tool calls** — name, input, result, duration, and error status
 - **Thinking blocks** — model reasoning with token usage
-- **Assistant text** — response content
-- **User messages** — prompts and tool results
+- **Assistant text** — response content, with API errors (rate limits, auth failures) flagged in red
+- **User messages** — prompts, tool results, and pasted images/documents
 - **Hooks** — pre/post hook executions (deduplicated from command+callback pairs)
-- **System events** — turn boundaries, compactions
-- **Compaction events** — context resets with trigger reason and pre-compaction token count
+- **System events** — turn durations, away-summaries, model fallbacks, stop hooks, queued prompts, PR links, published artifacts
+- **Compaction events** — context resets with trigger reason and before/after token counts
+- **Attachments** — skill listings, tool/agent/MCP deltas, plan-mode transitions, task reminders
 
-Each row shows the context added (Ctx+), running context total, time, and timestamp.
+Each row shows the context added (Ctx+), running context total, time, and timestamp. Rows carry badges for subagent spawns, API errors, skill attribution, and embedded images.
 
 ### Context Tracking
 
 - **Running total column** resets to zero after compaction boundaries
 - **Context sparkline** — an inline area chart showing token usage over time, with compaction drops marked as vertical lines. Click anywhere on the chart to jump to that event.
+- **Cache-miss diagnostics** — when the prompt cache is invalidated (e.g. `tools_changed`), the Ctx+ cell and detail panel explain why and how many tokens were re-read
 - **Hover breakdown** — hover the Total column to see cache read, cache creation, input, and output token counts
 - **Streaming deduplication** — events sharing a requestId (streamed chunks from the same API call) are dimmed with an `↑` indicator to avoid double-counting
 
@@ -70,9 +72,10 @@ Sessions with subagents show a scope picker on the left. Each agent (main, Task 
 
 Click any row to inspect it. The detail panel shows:
 
-- **Tool calls** — JSON tree viewer for input (collapsible, syntax-highlighted), full result text, metadata from tool_result events, success/error badge
-- **Thinking/Assistant** — full content with token breakdown
-- **Compaction** — trigger, pre-compaction token count, link to compaction subagent
+- **Tool calls** — JSON tree viewer for input (collapsible, syntax-highlighted), full result text, embedded result images rendered inline, metadata from tool_result events, success/error badge
+- **Thinking/Assistant** — full content with token breakdown, plus the model and reasoning effort that produced the turn and any skill/agent/MCP attribution
+- **User messages** — text plus rendered pasted images
+- **Compaction** — trigger, before/after/freed token counts, duration, link to compaction subagent
 - **All events** — timestamp badge, context info with hover breakdown
 
 ### Filtering
@@ -85,7 +88,9 @@ Click any row to inspect it. The detail panel shows:
 
 ### Session Browser
 
-A modal session picker groups sessions by project and labels each with the first user message from the session. Sessions are sorted by recency. The active session is polled for changes and the timeline updates live.
+A modal session picker groups sessions by project. Each session is labeled with its AI-generated title (falling back to agent name, then the first real user prompt — harness noise like local-command caveats is skipped) and shows a relative last-active time. Search matches titles, prompts, and file names. Sessions are sorted by recency, and duplicates of the same session across multiple data directories are collapsed to the newest copy. The active session is polled for changes and the timeline updates live.
+
+Extra Claude data directories (e.g. `~/.claude-personal`) can be added in the ⚙ settings modal; the config lives at `~/.claude/ccexplorer-config.json` (override the location with the `CCEXPLORER_CONFIG_PATH` environment variable).
 
 ### Navigation
 
@@ -95,7 +100,7 @@ Back/forward buttons track your selection history across scope jumps and row sel
 
 ```
 src/
-  cli.ts                  — CLI entry point (published as `ccex`)
+  cli.ts                  — CLI entry point (published as `ccexplorer`)
   index.ts                — programmatic entry point
   types.ts                — shared TypeScript types for all events and analysis
   parser/
